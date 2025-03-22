@@ -2,6 +2,9 @@
 config_local.py
 config_orig.py
 
+*.h5
+*.zarr
+
 # VS Code workspace config
 *.code-workspace
 .vscode/

@@ -17,6 +17,7 @@ import json
 import h5py  # for HDF5 backing
 from . import crandata
 from .crandata import CrAnData
+import zarr
 
 # -----------------------
 # Utility functions
@@ -46,6 +47,85 @@ def _read_chromsizes(chromsizes_file: Path) -> dict[str, int]:
     chromsizes = pd.read_csv(chromsizes_file, sep="\t", header=None, names=["chrom", "size"])
     return chromsizes.set_index("chrom")["size"].to_dict()
 
+def _check_bed_file_format(bed_file: Path) -> None:
+    with open(bed_file) as f:
+        first_line = f.readline().strip()
+    if len(first_line.split("\t")) < 3:
+        raise ValueError(f"BED file '{bed_file}' is not in the correct format. Expected at least three tab-separated columns.")
+    pattern = r".*\t\d+\t\d+.*"
+    if not re.match(pattern, first_line):
+        raise ValueError(f"BED file '{bed_file}' is not in the correct format. Expected columns 2 and 3 to contain integers.")
+
+def _filter_and_adjust_chromosome_data(peaks: pd.DataFrame, chrom_sizes: dict,
+                                      max_shift: int = 0, chrom_col: str = "chrom",
+                                      start_col: str = "start", end_col: str = "end",
+                                      MIN_POS: int = 0) -> pd.DataFrame:
+    peaks["_chr_size"] = peaks[chrom_col].map(chrom_sizes)
+    peaks = peaks.dropna(subset=["_chr_size"]).copy()
+    peaks["_chr_size"] = peaks["_chr_size"].astype(int)
+    starts = peaks[start_col].to_numpy(dtype=int)
+    ends = peaks[end_col].to_numpy(dtype=int)
+    chr_sizes_arr = peaks["_chr_size"].to_numpy(dtype=int)
+    orig_length = ends - starts
+    desired_length = orig_length + 2 * max_shift
+    new_starts = starts - max_shift
+    new_ends = new_starts + desired_length
+    cond_left_edge = new_starts < MIN_POS
+    shift_needed = MIN_POS - new_starts[cond_left_edge]
+    new_starts[cond_left_edge] = MIN_POS
+    new_ends[cond_left_edge] += shift_needed
+    cond_right_edge = new_ends > chr_sizes_arr
+    shift_needed = new_ends[cond_right_edge] - chr_sizes_arr[cond_right_edge]
+    new_ends[cond_right_edge] = chr_sizes_arr[cond_right_edge]
+    new_starts[cond_right_edge] -= shift_needed
+    cond_left_clamp = new_starts < MIN_POS
+    new_starts[cond_left_clamp] = MIN_POS
+    peaks[start_col] = new_starts
+    peaks[end_col] = new_ends
+    peaks.drop(columns=["_chr_size"], inplace=True)
+    return peaks
+
+def _read_consensus_regions(regions_file: Path, chromsizes_dict: dict | None = None) -> pd.DataFrame:
+    if chromsizes_dict is None:
+        logger.warning("Chromsizes file not provided. Will not check if regions are within chromosomes", stacklevel=1)
+    consensus_peaks = pd.read_csv(
+        regions_file,
+        sep="\t",
+        header=None,
+        usecols=[0, 1, 2],
+        dtype={0: str, 1: "Int32", 2: "Int32"},
+    )
+    consensus_peaks.columns = ["chrom", "start", "end"]
+    consensus_peaks["region"] = consensus_peaks["chrom"].astype(str) + ":" + \
+                                consensus_peaks["start"].astype(str) + "-" + \
+                                consensus_peaks["end"].astype(str)
+    if chromsizes_dict:
+        pass
+    else:
+        return consensus_peaks
+    valid_mask = consensus_peaks.apply(
+        lambda row: row["chrom"] in chromsizes_dict and row["start"] >= 0 and row["end"] <= chromsizes_dict[row["chrom"]],
+        axis=1,
+    )
+    consensus_peaks_filtered = consensus_peaks[valid_mask]
+    if len(consensus_peaks) != len(consensus_peaks_filtered):
+        logger.warning(f"Filtered {len(consensus_peaks) - len(consensus_peaks_filtered)} consensus regions (not within chromosomes)")
+    return consensus_peaks_filtered
+
+def _create_temp_bed_file(consensus_peaks: pd.DataFrame, target_region_width: int, adjust=True) -> str:
+    adjusted_peaks = consensus_peaks.copy()
+    if adjust:
+        adjusted_peaks[1] = adjusted_peaks.apply(
+            lambda row: max(0, row.iloc[1] - (target_region_width - (row.iloc[2] - row.iloc[1])) // 2),
+            axis=1,
+        )
+        adjusted_peaks[2] = adjusted_peaks[1] + target_region_width
+        adjusted_peaks[1] = adjusted_peaks[1].astype(int)
+        adjusted_peaks[2] = adjusted_peaks[2].astype(int)
+    temp_bed_file = "temp_adjusted_regions.bed"
+    adjusted_peaks.to_csv(temp_bed_file, sep="\t", header=False, index=False)
+    return temp_bed_file
+
 def _extract_values_from_bigwig(bw_file: Path, bed_file: Path, target: str,n_bins: int = None) -> np.ndarray:
     bw_file = str(bw_file)
     bed_file = str(bed_file)
@@ -53,9 +133,11 @@ def _extract_values_from_bigwig(bw_file: Path, bed_file: Path, target: str,n_bin
         chromosomes_in_bigwig = set(bw.chroms())
     temp_bed_file = tempfile.NamedTemporaryFile(delete=False)
     bed_entries_to_keep_idx = []
+    num_lines = 0
     with open(bed_file) as fh:
         for idx, line in enumerate(fh):
             chrom = line.split("\t", 1)[0]
+            num_lines +=1
             if chrom in chromosomes_in_bigwig:
                 temp_bed_file.write(line.encode("utf-8"))
                 bed_entries_to_keep_idx.append(idx)
@@ -105,117 +187,23 @@ def _extract_values_from_bigwig(bw_file: Path, bed_file: Path, target: str,n_bin
         raise ValueError(f"Unsupported target '{target}'")
     os.remove(temp_bed_file.name)
     if target == "raw":
-        all_data = np.full((total_bed_entries, values.shape[1]), np.nan, dtype=np.float32)
+        all_data = np.full((num_lines, values.shape[1]), np.nan, dtype=np.float32)
         all_data[bed_entries_to_keep_idx, :] = values
         return all_data
     else:
         if values.shape[0] != total_bed_entries:
-            all_values = np.full(total_bed_entries, np.nan, dtype=np.float32)
+            all_values = np.full(num_lines, np.nan, dtype=np.float32)
             all_values[bed_entries_to_keep_idx] = values
             return all_values
         else:
             return values
 
-def _read_consensus_regions(regions_file: Path, chromsizes_dict: dict | None = None) -> pd.DataFrame:
-    if chromsizes_dict is None:
-        logger.warning("Chromsizes file not provided. Will not check if regions are within chromosomes", stacklevel=1)
-    consensus_peaks = pd.read_csv(
-        regions_file,
-        sep="\t",
-        header=None,
-        usecols=[0, 1, 2],
-        dtype={0: str, 1: "Int32", 2: "Int32"},
-    )
-    consensus_peaks.columns = ["chrom", "start", "end"]
-    consensus_peaks["region"] = consensus_peaks["chrom"].astype(str) + ":" + \
-                                consensus_peaks["start"].astype(str) + "-" + \
-                                consensus_peaks["end"].astype(str)
-    if chromsizes_dict:
-        pass
-    else:
-        return consensus_peaks
-    valid_mask = consensus_peaks.apply(
-        lambda row: row["chrom"] in chromsizes_dict and row["start"] >= 0 and row["end"] <= chromsizes_dict[row["chrom"]],
-        axis=1,
-    )
-    consensus_peaks_filtered = consensus_peaks[valid_mask]
-    if len(consensus_peaks) != len(consensus_peaks_filtered):
-        logger.warning(f"Filtered {len(consensus_peaks) - len(consensus_peaks_filtered)} consensus regions (not within chromosomes)")
-    return consensus_peaks_filtered
-
-def _create_temp_bed_file(consensus_peaks: pd.DataFrame, target_region_width: int, adjust=True) -> str:
-    adjusted_peaks = consensus_peaks.copy()
-    if adjust:
-        adjusted_peaks[1] = adjusted_peaks.apply(
-            lambda row: max(0, row.iloc[1] - (target_region_width - (row.iloc[2] - row.iloc[1])) // 2),
-            axis=1,
-        )
-        adjusted_peaks[2] = adjusted_peaks[1] + target_region_width
-        adjusted_peaks[1] = adjusted_peaks[1].astype(int)
-        adjusted_peaks[2] = adjusted_peaks[2].astype(int)
-    temp_bed_file = "temp_adjusted_regions.bed"
-    adjusted_peaks.to_csv(temp_bed_file, sep="\t", header=False, index=False)
-    return temp_bed_file
-
-def _check_bed_file_format(bed_file: Path) -> None:
-    with open(bed_file) as f:
-        first_line = f.readline().strip()
-    if len(first_line.split("\t")) < 3:
-        raise ValueError(f"BED file '{bed_file}' is not in the correct format. Expected at least three tab-separated columns.")
-    pattern = r".*\t\d+\t\d+.*"
-    if not re.match(pattern, first_line):
-        raise ValueError(f"BED file '{bed_file}' is not in the correct format. Expected columns 2 and 3 to contain integers.")
-
-def _filter_and_adjust_chromosome_data(peaks: pd.DataFrame, chrom_sizes: dict,
-                                      max_shift: int = 0, chrom_col: str = "chrom",
-                                      start_col: str = "start", end_col: str = "end",
-                                      MIN_POS: int = 0) -> pd.DataFrame:
-    peaks["_chr_size"] = peaks[chrom_col].map(chrom_sizes)
-    peaks = peaks.dropna(subset=["_chr_size"]).copy()
-    peaks["_chr_size"] = peaks["_chr_size"].astype(int)
-    starts = peaks[start_col].to_numpy(dtype=int)
-    ends = peaks[end_col].to_numpy(dtype=int)
-    chr_sizes_arr = peaks["_chr_size"].to_numpy(dtype=int)
-    orig_length = ends - starts
-    desired_length = orig_length + 2 * max_shift
-    new_starts = starts - max_shift
-    new_ends = new_starts + desired_length
-    cond_left_edge = new_starts < MIN_POS
-    shift_needed = MIN_POS - new_starts[cond_left_edge]
-    new_starts[cond_left_edge] = MIN_POS
-    new_ends[cond_left_edge] += shift_needed
-    cond_right_edge = new_ends > chr_sizes_arr
-    shift_needed = new_ends[cond_right_edge] - chr_sizes_arr[cond_right_edge]
-    new_ends[cond_right_edge] = chr_sizes_arr[cond_right_edge]
-    new_starts[cond_right_edge] -= shift_needed
-    cond_left_clamp = new_starts < MIN_POS
-    new_starts[cond_left_clamp] = MIN_POS
-    peaks[start_col] = new_starts
-    peaks[end_col] = new_ends
-    peaks.drop(columns=["_chr_size"], inplace=True)
-    return peaks
-
-# -----------------------
-# X array writing
-# -----------------------
-def _load_x_to_memory(bw_files, consensus_peaks, target, target_region_width,
-                      out_path, obs_index, var_index, chunk_size=1024,n_bins=None):
+def _add_x_to_ds(adata, bw_files, consensus_peaks, target, target_region_width,
+                      obs_index, var_index, chunk_size=1024,n_bins=None):
     """
-    Write training data (extracted from bigWig files) to an HDF5 file.
+    Write training data (extracted from bigWig files) to zarr store.
+    Hackish use of low level zarr interface to stream data to disk then reload.
     The final shape is (n_obs, n_var, seq_len).
-
-    Parameters:
-      bw_files: list of bigWig file paths (one per observation)
-      consensus_peaks: DataFrame of consensus regions (used for creating a temporary BED)
-      target: extraction mode (e.g. "mean", "max", "raw", etc.)
-      target_region_width: integer width for the regions to extract
-      out_path: path to an HDF5 file to create or overwrite
-      obs_index: pandas Index for observations (rows)
-      var_index: pandas Index for variables (columns)
-      chunk_size: number of regions (columns) per chunk
-      n_bins: number of bins to take interpolated means, None gives full length
-    Returns:
-      X: an xarray DataArray backed by the HDF5 dataset with dims ["obs", "var", "seq_len"]
     """
     n_obs = len(bw_files)
     n_var = consensus_peaks.shape[0]
@@ -228,150 +216,50 @@ def _load_x_to_memory(bw_files, consensus_peaks, target, target_region_width,
         sample = sample.reshape(n_var, 1)
     seq_len = sample.shape[1]
     chunk_size = min(chunk_size, n_var)
-    
-    # Create an HDF5 file and preallocate a dataset "X"
-    with h5py.File(out_path, "w") as f:
-        dset = f.create_dataset("X", shape=(n_obs, n_var, seq_len),
-                                chunks=(n_obs, chunk_size, seq_len),
-                                dtype="float32",
-                                fillvalue=np.nan)
-        # Write each observation row into the dataset.
-        for i, bw_file in tqdm(enumerate(bw_files)):
-            temp_bed = _create_temp_bed_file(consensus_peaks, target_region_width)
-            result = _extract_values_from_bigwig(bw_file, temp_bed, target=target,n_bins=n_bins)
-            os.remove(temp_bed)
-            if result.ndim == 1:
-                result = result.reshape(n_var, 1)
-            dset[i, :, :] = result
-            # print(f"Wrote row {i+1}/{n_obs} from {bw_file}")
-    
-    # Read the dataset into a NumPy array and wrap it in an xarray DataArray.
-    with h5py.File(out_path, "r") as f:
-        X_array = f["X"][:]
-    X = xr.DataArray(X_array, dims=["obs", "var", "seq_bins"],
+
+    adata['X'] = xr.DataArray(np.empty([n_obs,n_var,seq_len]), dims=["obs", "var", "seq_bins"],
                      coords={"obs": np.array(obs_index),
                              "var": np.array(var_index),
                              "seq_bins": np.arange(seq_len)})
-    return X
-
-# def _write_X_in_chunks(bw_files, consensus_peaks, target, target_region_width,
-#                        out_path, obs_index, var_index, chunk_size=1024, n_bins=None):
-#     """
-#     Write training data (extracted from bigWig files) to an HDF5 file.
-#     The final dataset "X" is stored in chunks and will remain on disk.
-#     Additionally, the observation and variable metadata are saved as groups.
-#     The returned xarray DataArray is backed by a LazyH5Array referencing the dataset.
-
-#     Parameters:
-#       bw_files: list of bigWig file paths (one per observation)
-#       consensus_peaks: DataFrame of consensus regions (used for creating a temporary BED)
-#       target: extraction mode (e.g. "mean", "max", "raw", etc.)
-#       target_region_width: integer width for the regions to extract
-#       out_path: path to an HDF5 file to create or overwrite
-#       obs_index: pandas Index for observations (rows)
-#       var_index: pandas Index for variables (columns)
-#       chunk_size: number of regions (columns) per chunk
-#       n_bins: number of bins to take interpolated means; if None, returns full length
-
-#     Returns:
-#       X: an xarray DataArray whose data is lazily loaded from the HDF5 dataset "X",
-#          and which has dims ["obs", "var", "seq_len"].
-#     """
-#     n_obs = len(bw_files)
-#     n_var = consensus_peaks.shape[0]
-
-#     # Determine sequence length using the first file.
-#     temp_bed = _create_temp_bed_file(consensus_peaks, target_region_width)
-#     sample = _extract_values_from_bigwig(bw_files[0], temp_bed, target=target, n_bins=n_bins)
-#     os.remove(temp_bed)
-#     if sample.ndim == 1:
-#         sample = sample.reshape(n_var, 1)
-#     seq_len = sample.shape[1]
-#     chunk_size = min(chunk_size, n_var)
-
-#     with h5py.File(out_path, "w") as f:
-#         # Create dataset "X" with chunking; do not load into memory.
-#         dset = f.create_dataset(
-#             "X",
-#             shape=(n_obs, n_var, seq_len),
-#             chunks=(n_obs, chunk_size, seq_len),
-#             dtype="float32",
-#             fillvalue=np.nan,
-#         )
-#         # Write each observation (row) into the dataset.
-#         for i, bw_file in enumerate(bw_files):
-#             temp_bed = _create_temp_bed_file(consensus_peaks, target_region_width)
-#             result = _extract_values_from_bigwig(bw_file, temp_bed, target=target, n_bins=n_bins)
-#             os.remove(temp_bed)
-#             if result.ndim == 1:
-#                 result = result.reshape(n_var, 1)
-#             dset[i, :, :] = result
-#             print(f"Wrote row {i+1}/{n_obs} from {bw_file}")
-#         crandata._save_dataframe(f, "obs", pd.DataFrame(obs_index))
-#         crandata._save_dataframe(f, "var", pd.DataFrame(var_index))
-#     # Instead of reading dset back into memory, wrap it in LazyH5Array.
-#     lazy_X = crandata.LazyH5Array(out_path, "X", shape=(n_obs, n_var, seq_len), dtype=dset.dtype, chunks=dset.chunks)
-#     # Create an xarray DataArray that is backed by the lazy loader.
-#     X = xr.DataArray(lazy_X, dims=["obs", "var", "seq_len"],
-#                      coords={"obs": np.array(obs_index),
-#                              "var": np.array(var_index),
-#                              "seq_len": np.arange(seq_len)})
     
-#     return X
-
+    store_path = adata.encoding['source']
+    adata.to_zarr(store_path,mode='a')
+    
+    # Open the Zarr store directly for chunk-wise writes
+    store = zarr.open(store_path, mode='a')
+    
+    # Explicitly create the "X" dataset if not already present
+    if 'X' not in store:
+        store.create_dataset(
+            'X', shape=(n_obs, n_var, seq_len),
+            chunks=(n_obs, chunk_size, seq_len),
+            dtype='float32',
+            fill_value=np.nan
+        )
+    
+    # Write data chunk-wise directly to Zarr store
+    for i, bw_file in tqdm(enumerate(bw_files), total=n_obs):
+        temp_bed = _create_temp_bed_file(consensus_peaks, target_region_width)
+        result = _extract_values_from_bigwig(bw_file, temp_bed, target=target, n_bins=n_bins)
+        os.remove(temp_bed)
+    
+        if result.ndim == 1:
+            result = result.reshape(n_var, 1)
+    
+        # Directly assign the chunk into the Zarr array
+        store['X'][i, :, :] = result.astype('float32')
+    
+    adata = CrAnData.open_zarr(store_path)        
 
 def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
                    backed_path: Path, target_region_width: int | None,
-                   target: str = 'raw',  # e.g. "raw", "mean", etc.
+                   target: str = 'raw',  # e.g. "raw", "mean", "max", etc.
                    chromsizes_file: Path | None = None, genome: any = None,
-                   max_stochastic_shift: int = 0, chunk_size: int = 512, n_bins: int = None) -> CrAnData:
+                   max_stochastic_shift: int = 0, chunk_size: int = 512, n_bins: int = None) -> 'CrAnData':
     """
     Import bigWig files and consensus regions to create a backed CrAnData object.
-
-    This function reads all valid bigWig files from a given directory, extracts signal values
-    over consensus regions specified in a BED file, and writes the resulting data (X) into an
-    HDF5 file for backing. The consensus regions are filtered and adjusted based on the target 
-    region width and any stochastic shifts provided. Chromosome sizes can be provided via a file
-    or through a genome object. Additional metadata is stored in the 'uns' attribute of the 
-    resulting CrAnData object.
-
-    Parameters:
-        bigwigs_folder (Path): Path to the directory containing bigWig files.
-        regions_file (Path): Path to the BED file defining consensus regions.
-        backed_path (Path): Path to the HDF5 file where the extracted X array will be stored.
-        target_region_width (int | None): The desired width of target regions for extraction.
-        target (str, optional): Extraction mode, e.g. "raw", "mean", "max", etc. Default is "raw".
-        chromsizes_file (Path | None, optional): Path to a file containing chromosome sizes.
-                                                 If provided, these sizes are used to validate regions.
-        genome (any, optional): A genome object which must have a `chrom_sizes` attribute.
-                                If provided, its chromosome sizes will be used.
-        max_stochastic_shift (int, optional): Maximum number of base pairs for stochastic shifting 
-                                              applied during region adjustment. Default is 0.
-        chunk_size (int, optional): Number of region columns per chunk when writing the HDF5 dataset.
-                                    Default is 512.
-        n_bin (int, optional): number of bins to take interpolated means, None gives all values.
-
-
-    Returns:
-        CrAnData: A CrAnData object whose X attribute is backed by the HDF5 file at `backed_path`.
-                  The object also contains obs and var DataFrames and metadata in its uns attribute 
-                  (including target_region_width, shifted_region_width, and max_stochastic_shift).
-
-    Raises:
-        FileNotFoundError: If `bigwigs_folder` is not a directory or if `regions_file` is not found.
-        FileNotFoundError: If no valid bigWig files are found in `bigwigs_folder`.
-
-    Workflow:
-        1. Validate input paths for the bigWig folder and regions file.
-        2. Read chromosome sizes from `chromsizes_file` or from the provided genome object.
-        3. Check the format of the regions (BED) file and load the consensus regions.
-        4. Filter consensus regions to keep those with a uniform width and adjust them based on 
-           `max_stochastic_shift`. The final target width is computed as 
-           `target_region_width + 2 * max_stochastic_shift`.
-        5. Collect all valid bigWig files from the directory.
-        6. Use `_load_x_to_memory` to extract the signal values from each bigWig file over the consensus 
-           regions and write the resulting data to an HDF5 file.
-        7. Create and return a CrAnData object wrapping the backed X array along with obs and var DataFrames.
+    This function validates inputs, filters and adjusts consensus regions (using _filter_and_adjust_chromosome_data),
+    collects valid bigWig files, extracts signal values into an HDF5 file, and returns a CrAnData object.
     """
     bigwigs_folder = Path(bigwigs_folder)
     regions_file = Path(regions_file)
@@ -380,7 +268,8 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
     if not regions_file.is_file():
         raise FileNotFoundError(f"File '{regions_file}' not found")
     
-    # Read chromosome sizes if provided.
+    # Read chromosome sizes.
+    chromsizes_dict = None
     if chromsizes_file is not None:
         chromsizes_dict = _read_chromsizes(chromsizes_file)
     if genome is not None:
@@ -396,69 +285,63 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
     
     # Collect valid bigWig files.
     bw_files = []
-    chrom_set = set()
+    chrom_set = set([])  # Start with no chromosomes
     for file in tqdm(os.listdir(bigwigs_folder)):
         file_path = os.path.join(bigwigs_folder, file)
         try:
             bw = pybigtools.open(file_path, "r")
-            chrom_set |= set(bw.chroms().keys())
+            file_chroms = set(bw.chroms().keys())
+            chrom_set |= file_chroms
             bw_files.append(file_path)
             bw.close()
         except (ValueError, pybigtools.BBIReadError):
             pass
+    # If no valid chromosomes were found, default to an empty set.
+    chrom_set = set(chrom_set)
+    # Filter consensus regions (var) to include only regions on chromosomes present in all bigWig files.
     consensus_peaks = consensus_peaks.loc[consensus_peaks["chrom"].isin(chrom_set), :]
+
     bw_files = sorted(bw_files)
     if not bw_files:
         raise FileNotFoundError(f"No valid bigWig files found in '{bigwigs_folder}'")
     
     logger.info(f"Extracting values from {len(bw_files)} bigWig files...")
-    # Create obs and var DataFrames.
+    # Build obs and var DataFrames.
     obs_df = pd.DataFrame(
         {"file_path": bw_files},
         index=[os.path.basename(file).rpartition(".")[0].replace(".", "_") for file in bw_files]
     )
     var_df = consensus_peaks.set_index("region")
     var_df["chunk_index"] = np.arange(var_df.shape[0]) // chunk_size
+    extra_vars = {}
+    for col in obs_df.columns:
+        extra_vars[f"obs-_-{col}"] = xr.DataArray(obs_df[col].values, dims=["obs"])
+    extra_vars["obs-_-index"] = xr.DataArray(obs_df.index.values, dims=["obs"])
+    for col in var_df.columns:
+        extra_vars[f"var-_-{col}"] = xr.DataArray(var_df[col].values, dims=["var"])
+    extra_vars["var-_-index"] = xr.DataArray(var_df.index.values, dims=["var"])
     
-    # Write X into memory via the helper function.
-    # (Note: _load_x_to_memory still writes to a temporary HDF5 file internally,
-    #  but we use the resulting X in memory.)
-    X = _load_x_to_memory(
+    adata = CrAnData(**extra_vars)
+    # os.makedirs(str(backed_path), exist_ok=False)
+    adata.to_zarr(str(backed_path),mode='w')
+    adata = CrAnData.open_zarr(str(backed_path))
+
+    X = _add_x_to_ds(
+        adata,
         bw_files, consensus_peaks, target, target_region_width,
-        out_path="temporary_file.h5",  # temporary file; not used for final storage
         obs_index=obs_df.index, var_index=var_df.index,
         chunk_size=chunk_size, n_bins=n_bins
     )
-    # Build extra data variables from the obs and var DataFrames.
-    extra_vars = {}
-    # Store each obs column as an individual data variable.
-    obs_df.columns = [str(x) for x in obs_df.columns]
-    for col in obs_df.columns:
-        extra_vars[f"obs/{col}"] = xr.DataArray(obs_df[col].values, dims=["obs"])
-    extra_vars["obs/index"] = xr.DataArray(obs_df.index.values, dims=["obs"])
-
-    # Similarly, store each var column.
-    var_df.columns = [str(x) for x in var_df.columns]
-    for col in var_df.columns:
-        extra_vars[f"var/{col}"] = xr.DataArray(var_df[col].values, dims=["var"])
-    extra_vars["var/index"] = xr.DataArray(var_df.index.values, dims=["var"])
-    
-    # Create the CrAnData object by merging X and the extra variables.
-    adata = CrAnData(X=X, **extra_vars)#,always_convert_df = ['obs','var'])
-    # Save additional parameters in the attributes.
+    # Add extra variables as before.
     adata.attrs["params"] = json.dumps({
         'target_region_width': target_region_width,
-        'shifted_region_width': shifted_width,
+        'shifted_region_width': target_region_width + 2 * max_stochastic_shift,
         'max_stochastic_shift': max_stochastic_shift,
         'chunk_size': chunk_size
     })
-    
-    # Write out the CrAnData object as a NetCDF file.
-    adata.to_netcdf(str(backed_path))
-    # Reload the dataset using the open_dataset class method.
-    adata = CrAnData.open_dataset(str(backed_path))
+    adata.to_zarr(str(backed_path),mode='w')
+    adata = CrAnData.open_zarr(str(backed_path))        
     return adata
-
 
 # -----------------------
 # Additional utility functions
@@ -470,10 +353,10 @@ def prepare_intervals(adata):
     Returns a dictionary {chrom: [(start, end, var_name), ... sorted by start]}.
     """
     df = pd.DataFrame({
-        "chrom": adata["var/chrom"].data.astype(str),
-        "start": adata["var/start"].data,
-        "end": adata["var/end"].data
-    }, index=adata['var/index'].data)
+        "chrom": adata["var-_-chrom"].data.astype(str),
+        "start": adata["var-_-start"].data,
+        "end": adata["var-_-end"].data
+    }, index=adata['var-_-index'].data)
     df = df.sort_values(["chrom", "start"])
     
     chrom_intervals = defaultdict(list)
@@ -526,7 +409,7 @@ def add_contact_strengths_to_varp(adata, bedp_files, key="hic_contacts"):
     then wraps it in an xarray DataArray.
     """
     # if "chrom" not in adata.sizes['var']columns:
-    #     var_index = adata['var/index'].astype(str)
+    #     var_index = adata['var-_-index'].astype(str)
     #     adata.var["chrom"] = var_index.str.split(":").str[0]
     #     adata.var["start"] = var_index.str.split(":").str[1].str.split("-").str[0].astype(int)
     #     adata.var["end"] = var_index.str.split(":").str[1].str.split("-").str[1].astype(int)
@@ -534,7 +417,7 @@ def add_contact_strengths_to_varp(adata, bedp_files, key="hic_contacts"):
     chrom_intervals = prepare_intervals(adata)
     num_bins = adata.sizes['var']
     num_files = len(bedp_files)
-    var_name_to_i = {v: i for i, v in enumerate(adata['var/index'].data)}
+    var_name_to_i = {v: i for i, v in enumerate(adata['var-_-index'].data)}
     
     all_rows = []
     all_cols = []
@@ -599,10 +482,10 @@ def add_contact_strengths_to_varp(adata, bedp_files, key="hic_contacts"):
         contacts_tensor,
         dims=["var", "var_1", "obs"],
         coords={
-            "var": np.array(adata['var/index'].data),
-            "var_1": np.array(adata['var/index'].data),
+            "var": np.array(adata['var-_-index'].data),
+            "var_1": np.array(adata['var-_-index'].data),
             "obs": np.array([os.path.basename(x).replace('.bedp','') for x in bedp_files])
         }
     )
-    adata[f"varp/{key}"] = contacts_xr
+    adata[f"varp-_-{key}"] = contacts_xr
     return contacts_xr

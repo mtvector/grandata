@@ -235,7 +235,7 @@ class DNATransform:
     def __init__(self, out_len: int, random_rc: bool = False, max_shift: int = None):
         """
         Initialize a DNATransform.
-        
+
         Parameters
         ----------
         out_len : int
@@ -243,75 +243,105 @@ class DNATransform:
         random_rc : bool, default False
             If True, each sample has a 50% chance to be reverse complemented.
         max_shift : int, optional
-            The maximum number of bases to randomly shift the window center away from the sequence midpoint.
-            Defaults to the maximum allowed value: (seq_len - out_len) // 2.
-            If provided, its absolute value is clipped to (seq_len - out_len) // 2.
+            The maximum number of bases to shift the window center away from the sequence midpoint.
+            Defaults to 0 shift if not provided.
         """
         self.out_len = out_len
         self.random_rc = random_rc
         self.max_shift_param = max_shift
 
-    def __call__(self, da: xr.DataArray) -> xr.DataArray:
+    def get_window_indices(self, seq_len: int, shift: int = 0) -> (int, int):
         """
-        Transform a one-hot encoded DataArray by extracting shifted windows and, optionally,
-        reverse complementing them.
-        
-        Each window is extracted from the original sequence such that its center is randomly
-        shifted from the midpoint by an integer in [-max_shift, max_shift]. Then, if random_rc
-        is enabled, a 50% coin flip determines whether the window is reverse complemented.
-        
-        The reverse complement is implemented by reversing the sequence order along the
-        seq_len dimension and swapping the nucleotide channels (ACGT → TGCA).
-        
+        Compute the start and end indices for window extraction.
+
+        Parameters
+        ----------
+        seq_len : int
+            Original sequence length.
+        shift : int, optional
+            Desired shift from the center (default is 0). If a nonzero value is provided,
+            it will be clipped to the maximum allowed value.
+
+        Returns
+        -------
+        start_index, end_index : (int, int)
+            The start and end indices for slicing.
+        """
+        if self.out_len > seq_len:
+            raise ValueError(f"out_len ({self.out_len}) cannot be larger than seq_len ({seq_len}).")
+        allowed_max_shift = (seq_len - self.out_len) // 2
+        effective_shift = np.clip(shift, -allowed_max_shift, allowed_max_shift)
+        mid = seq_len // 2
+        new_center = mid + effective_shift
+        start_index = new_center - (self.out_len // 2)
+        end_index = start_index + self.out_len
+        return start_index, end_index
+
+    def get_window_indices_and_rc(self, da: xr.DataArray, shift: int = None):
+        """
+        Given a one-hot encoded DataArray (with dims ["var", "seq_len", "nuc"]),
+        compute the indices for window extraction and return the indices along with
+        a boolean array indicating which samples should be reverse complemented.
+
         Parameters
         ----------
         da : xarray.DataArray
-            One-hot encoded array with dimensions ["var", "seq_len", "nuc"].
-            
+            Input one-hot encoded sequences.
+        shift : int, optional
+            Desired shift value. Defaults to 0 if not provided.
+
         Returns
         -------
-        xr.DataArray
-            Transformed DataArray with dimensions ["var", "seq_len", "nuc"] where seq_len equals out_len.
+        start, end : int
+            The start and end indices to slice the seq_len dimension.
+        rc_flags : numpy.ndarray
+            Boolean array of length equal to the number of samples (var dimension)
+            indicating for each sample whether reverse complement should be applied.
         """
-        # Get the original sequence length from the DataArray.
+        if shift is None:
+            shift = 0
         seq_len = da.sizes["seq_len"]
-        if self.out_len > seq_len:
-            raise ValueError(f"out_len ({self.out_len}) cannot be larger than seq_len ({seq_len}).")
-        
-        # Compute allowed maximum shift so that window stays in bounds.
-        allowed_max_shift = (seq_len - self.out_len) // 2
-        # Determine effective max_shift from parameter (or default)
-        if self.max_shift_param is None:
-            effective_max_shift = allowed_max_shift
+        start, end = self.get_window_indices(seq_len, shift)
+        if self.random_rc:
+            rc_flags = np.random.rand(da.sizes["var"]) < 0.5
         else:
-            effective_max_shift = min(abs(self.max_shift_param), allowed_max_shift)
-        
-        # Precompute the midpoint (using integer division).
-        mid = seq_len // 2
+            rc_flags = np.zeros(da.sizes["var"], dtype=bool)
+        return start, end, rc_flags
 
-        transformed_windows = []
-        # Loop over each sample (var) to apply independent transformations.
-        for i in range(da.sizes["var"]):
-            # Sample a random shift from -effective_max_shift to effective_max_shift.
-            shift = np.random.randint(-effective_max_shift, effective_max_shift + 1) if effective_max_shift > 0 else 0
-            new_center = mid + shift
-            start_index = new_center - (self.out_len // 2)
-            end_index = start_index + self.out_len
-            
-            # Use isel for lazy slicing; extract the window from the current sample.
-            window = da.isel(var=i, seq_len=slice(start_index, end_index))
-            
-            # Optionally apply reverse complement:
-            if self.random_rc and np.random.rand() < 0.5:
-                # Reverse the order along the sequence dimension and swap nucleotide channels.
-                # This is done by slicing seq_len in reverse and nuc in reverse.
-                window = window.isel(seq_len=slice(None, None, -1)).isel(nuc=slice(None, None, -1))
-            
-            transformed_windows.append(window)
-        
-        # Concatenate all transformed windows along the "var" dimension.
-        transformed_da = xr.concat(transformed_windows, dim="var")
-        
-        # Optionally, reassign a coordinate for seq_len to reflect the new window length.
-        transformed_da = transformed_da.assign_coords(seq_len=np.arange(self.out_len))
-        return transformed_da
+    def reverse_complement(self, da):
+        """
+        Reverse complement a one-hot encoded sequence or batch DataSet.
+        Assumes that the DataArray has dims ["seq_len", "nuc"].
+        The reverse complement is implemented by reversing the order along
+        the 'seq_len' dimension and swapping the nucleotide channels (e.g. ACGT → TGCA).
+        """
+        # Reverse the sequence order along 'seq_len' and the nucleotide order along 'nuc'
+        return da.isel(seq_len=slice(None, None, -1)).isel(nuc=slice(None, None, -1))
+
+    def apply_rc(self, window, rc_flags):
+        """
+        Apply reverse complementing to each sample in the window DataArray where indicated.
+
+        Parameters
+        ----------
+        window : xarray.DataArray
+            DataArray with dimensions ["var", "seq_len", "nuc"] representing the extracted window.
+        rc_flags : numpy.ndarray
+            Boolean array of length equal to window.sizes["var"] indicating which samples
+            should be reverse complemented.
+
+        Returns
+        -------
+        xarray.DataArray
+            DataArray with reverse complement applied where appropriate.
+        """
+        if not self.random_rc:
+            return window
+        samples = []
+        for i in range(window.sizes["var"]):
+            sample = window.isel(var=i)
+            if rc_flags[i]:
+                sample = self.reverse_complement(sample)
+            samples.append(sample)
+        print('samples',samples)
+        return xr.concat(samples, dim="var")
