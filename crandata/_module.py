@@ -5,7 +5,8 @@ import xbatcher
 import xarray as xr
 import os
 import zarr
-from torchdata.nodes import BaseNode, Loader, MultiNodeWeightedSampler
+from .crandata import CrAnData
+from torchdata.nodes import BaseNode, Loader, IterableWrapper, ParallelMapper
 
 def _reindex_array(array, local_obs, global_obs):
     """
@@ -21,9 +22,6 @@ def _reindex_array(array, local_obs, global_obs):
             new_array[idx[0]] = array[i]
     return new_array
 
-# ---------------------------------------------------------------------------
-# New Node that wraps a CrAnDataModule for use with torchdata.nodes.
-# ---------------------------------------------------------------------------
 class CrAnDataNode(BaseNode):
     """
     A torchdata.nodes.BaseNode that iterates over batches produced by a CrAnDataModule.
@@ -55,9 +53,70 @@ class CrAnDataNode(BaseNode):
     def get_state(self):
         return {"index": self.index}
 
-# ---------------------------------------------------------------------------
-# New CrAnDataModule using torchdata.nodes for dataloading.
-# ---------------------------------------------------------------------------
+class RoundRobinNode(BaseNode):
+    def __init__(self, nodes, concat_dim='var', join='inner', num_workers=1):
+        super().__init__()
+        self.nodes = nodes
+        self.concat_dim = concat_dim
+        self.join = join
+        self.num_workers = num_workers
+
+    def reset(self, initial_state=None):
+        super().reset(initial_state)
+        for node in self.nodes:
+            node.reset(initial_state)
+
+    def get_state(self):
+        return {i: node.get_state() for i, node in enumerate(self.nodes)}
+
+    def _get_next_batch(self, node):
+        # Attempt to fetch the next batch; if exhausted, reset and try again.
+        try:
+            return next(node)
+        except StopIteration:
+            node.reset()
+            return next(node)
+
+    def next(self):
+        # Use ParallelMapper to apply _get_next_batch to each node concurrently.
+        mapper = ParallelMapper(
+            source=IterableWrapper(self.nodes),
+            map_fn=self._get_next_batch,
+            num_workers=self.num_workers,
+            method="thread"
+        )
+        batches = list(mapper)
+        return xr.concat(*batches, dim=self.concat_dim, join=self.join)
+
+class SequentialNode(BaseNode):
+    def __init__(self, nodes):
+        super().__init__()
+        self.nodes = nodes
+        self.current = 0
+
+    def reset(self, initial_state=None):
+        super().reset(initial_state)
+        for node in self.nodes:
+            node.reset(initial_state)
+        self.current = 0
+
+    def get_state(self):
+        return {
+            "current": self.current,
+            "states": [node.get_state() for node in self.nodes]
+        }
+
+    def next(self):
+        # Loop until we find a node with data or we run out of nodes.
+        while self.current < len(self.nodes):
+            try:
+                # Attempt to fetch the next batch from the current node.
+                return next(self.nodes[self.current])
+            except StopIteration:
+                # If exhausted, move to the next node.
+                self.current += 1
+        raise StopIteration
+
 class CrAnDataModule:
     """
     A module wrapping a CrAnData object (e.g. an xarray.Dataset with genomic data)
@@ -70,14 +129,22 @@ class CrAnDataModule:
       shuffle_dims: List of dimension names to be shuffled uniformly in each batch.
       dnatransform: Optional callable applied to the "sequences" variable.
     """
-    def __init__(self, adata, batch_size=256, shuffle=True, dnatransform=None, shuffle_dims=None,cache_dir = './batch_cache',load_variables={'sequences':'sequences'}):
+    def __init__(self, adata, batch_size=32, shuffle=True, dnatransform=None, shuffle_dims=None,cache_dir = './batch_cache',data_sources={'sequences':'sequences'},split='var-_-split',batch_dim='var'):
         self.adata = adata
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.dnatransform = dnatransform
         self.shuffle_dims = shuffle_dims or []  # e.g. ['obs']
         self._generators = {}  # Holds xbatcher generators for each state
+        self.split = split
+        self.batch_dim = batch_dim
         # self.cache_dir = str(cache_dir)
+        self.state_instructions = {
+            "train": {"apply_rc": True, "shuffle": True},
+            "val": {"apply_rc": True, "shuffle": True},
+            "test": {"apply_rc": False, "shuffle": False},
+            "predict": {"apply_rc": False, "shuffle": False},
+        }
 
     def setup(self, state="train"):
         """
@@ -85,29 +152,34 @@ class CrAnDataModule:
         (It is assumed that the CrAnData object already has appropriate sample probabilities.)
         """
         dim_dict = dict(self.adata.dims)
-        dim_dict['var'] = self.batch_size
+        dim_dict[self.batch_dim] = self.batch_size
         dim_dict.pop('item', None)
         # os.makedirs(self.cache_dir,exist_ok=True)
-        # cache_store = zarr.storage.DirectoryStore(self.cache_dir)
-
+        # cache_store = zarr.storage.LocalStore(self.cache_dir)
+        self.adata = CrAnData.open_zarr(self.adata.encoding['source'])#Reload from disk for more robustness
+        state_idx = self.adata[self.split].compute()==state
+        print(state_idx)
         self._generators[state] = xbatcher.BatchGenerator(
-            ds=self.adata,
+            ds=self.adata.isel({self.batch_dim:state_idx}) if state != 'predict' else self.adata,
             input_dims=dim_dict,
-            batch_dims={'var': self.batch_size},
+            batch_dims={self.batch_dim: self.batch_size},
             cache=None #For now, idk might be useful later
         )
 
-    def get_batch(self, state, index):
+    def get_batch(self, state, index, instructions=None):
         if state not in self._generators:
             raise ValueError(f"Generator for state '{state}' not set. Call setup('{state}') first.")
+        instructions = instructions or self.state_instructions.get(state, {})
         batch = self._generators[state][index]
-        if self.dnatransform is not None and 'sequences' in batch.data_vars:
+
+        # Handle reverse complementing if needed.
+        if instructions.get("apply_rc") and self.dnatransform is not None and 'sequences' in batch.data_vars:
             start, end, rc_flags = self.dnatransform.get_window_indices_and_rc(batch['sequences'])
-            subset_seq = batch['sequences'].isel(seq_len=slice(start, end))
             batch = batch.isel(seq_len=slice(start, end))
-            transformed = self.dnatransform.apply_rc(batch, rc_flags)
-    
-        if self.shuffle and self.shuffle_dims:
+            batch = self.dnatransform.apply_rc(batch, rc_flags)
+
+        # Handle shuffling if needed.
+        if instructions.get("shuffle") and self.shuffle_dims:
             for dim in self.shuffle_dims:
                 example = next((da for da in batch.data_vars.values() if dim in da.dims), None)
                 if example is not None:
@@ -118,36 +190,36 @@ class CrAnDataModule:
                             batch.data_vars[var_name] = da.isel({dim: perm})
         return batch
 
-    # -------------------------------------------------------------------------
-    # Dataloader properties returning torchdata Loaders.
-    # -------------------------------------------------------------------------
+
+    @property
+    def train_dataloader(self):
+        return self._get_dataloader("train")
+
+    @property
+    def val_dataloader(self):
+        return self._get_dataloader("val")
+
+    @property
+    def test_dataloader(self):
+        return self._get_dataloader("test")
+
+    @property
+    def predict_dataloader(self):
+        return self._get_dataloader("predict")
+
     @property
     def train_dataloader(self):
         node = CrAnDataNode(self, state="train")
         return Loader(node)
-
-    @property
-    def val_dataloader(self):
-        node = CrAnDataNode(self, state="val")
-        return Loader(node)
-
-    @property
-    def test_dataloader(self):
-        node = CrAnDataNode(self, state="test")
-        return Loader(node)
-
-    @property
-    def predict_dataloader(self):
-        node = CrAnDataNode(self, state="predict")
+        
+    def _get_dataloader(self, state: str):
+        node = CrAnDataNode(self, state=state)
         return Loader(node)
 
     def __repr__(self):
         return (f"CrAnDataModule(batch_size={self.batch_size}, "
                 f"shuffle_dims={self.shuffle_dims}, dnatransform={self.dnatransform})")
 
-# ---------------------------------------------------------------------------
-# New MetaCrAnDataModule using torchdata.nodes.MultiNodeWeightedSampler.
-# ---------------------------------------------------------------------------
 class MetaCrAnDataModule:
     """
     Combines multiple CrAnData objects (each wrapped in a CrAnDataModule) into a single meta–module.
@@ -156,48 +228,59 @@ class MetaCrAnDataModule:
     
     Attributes:
       modules: List of CrAnDataModule instances.
-      file_probs: Per–module sampling probabilities (default: uniform).
       epoch_size: Number of batches per epoch (for reference).
     """
-    def __init__(self, adatas, batch_size=256, shuffle=True, dnatransform=None, shuffle_dims=None, epoch_size=100000,file_probs = None):
+    def __init__(self, adatas, batch_size=256, shuffle=True, dnatransform=None, shuffle_dims=None, epoch_size=100000,data_sources={'sequences':'sequences'},batch_dim='var',num_workers=1,join='inner'):
+        self.batch_dim = batch_dim
+        self.batch_size = batch_size
         self.modules = [
             CrAnDataModule(adata, batch_size=batch_size, shuffle=shuffle,
-                           dnatransform=dnatransform, shuffle_dims=shuffle_dims)
+                           dnatransform=dnatransform, shuffle_dims=shuffle_dims, data_sources=data_sources)
             for adata in adatas
         ]
-        self.file_probs = np.ones(len(self.modules)) / len(self.modules) if file_probs is None else file_probs
         self.epoch_size = epoch_size
+        self.join = join
+        self.num_workers = num_workers
+        self.coords = xr.concat(adatas,batch_dim,join=self.join).coords
 
+    def setup(self, state="train"):
+        for mod in self.modules:
+            mod.setup(state)
+    
     @property
     def train_dataloader(self):
-        nodes = {f"module_{i}": CrAnDataNode(mod, state="train")
-                 for i, mod in enumerate(self.modules)}
-        weights = {f"module_{i}": self.file_probs[i] for i in range(len(self.modules))}
-        multi_node = MultiNodeWeightedSampler(nodes, weights)
+        nodes = [IterableWrapper(mod) for mod in self.modules]
+        multi_node = RoundRobinNode(
+            nodes, concat_dim=self.batch_dim, join=self.join, num_workers=self.num_workers
+        )
+        multi_node = CrAnDataNode(multi_node, state='train')
         return Loader(multi_node)
 
     @property
     def val_dataloader(self):
-        nodes = {f"module_{i}": CrAnDataNode(mod, state="val")
-                 for i, mod in enumerate(self.modules)}
-        weights = {f"module_{i}": self.file_probs[i] for i in range(len(self.modules))}
-        multi_node = MultiNodeWeightedSampler(nodes, weights)
+        nodes = [IterableWrapper(mod) for mod in self.modules]
+        multi_node = SequentialNode(
+            nodes,
+        )
+        multi_node = CrAnDataNode(multi_node, state='val')
         return Loader(multi_node)
 
     @property
     def test_dataloader(self):
-        nodes = {f"module_{i}": CrAnDataNode(mod, state="test")
-                 for i, mod in enumerate(self.modules)}
-        weights = {f"module_{i}": self.file_probs[i] for i in range(len(self.modules))}
-        multi_node = MultiNodeWeightedSampler(nodes, weights)
+        nodes = [IterableWrapper(mod) for mod in self.modules]
+        multi_node = SequentialNode(
+            nodes,
+        )
+        multi_node = CrAnDataNode(multi_node, state='test')
         return Loader(multi_node)
 
     @property
     def predict_dataloader(self):
-        nodes = {f"module_{i}": CrAnDataNode(mod, state="predict")
-                 for i, mod in enumerate(self.modules)}
-        weights = {f"module_{i}": self.file_probs[i] for i in range(len(self.modules))}
-        multi_node = MultiNodeWeightedSampler(nodes, weights)
+        nodes = [IterableWrapper(mod) for mod in self.modules]
+        multi_node = SequentialNode(
+            nodes,
+        )
+        multi_node = CrAnDataNode(multi_node, state='predict')
         return Loader(multi_node)
 
     def __repr__(self):
