@@ -17,35 +17,6 @@ class Genome:
     A class that encapsulates information about a genome, including its FASTA sequence, its annotation, and chromosome sizes.
 
     Adapted from https://github.com/kaizhang/SnapATAC2/blob/main/snapatac2-python/python/snapatac2/genome.py.
-
-    Parameters
-    ----------
-    fasta
-        The path to the FASTA file.
-    chrom_sizes
-        A path to a tab delimited chromsizes file or a dictionary containing chromosome names and sizes.
-        If not provided, the chromosome sizes will be inferred from the FASTA file.
-    annotation
-        The path to the annotation file.
-    name
-        Optional name of the genome.
-
-    Examples
-    --------
-    >>> genome = Genome(
-    ...     fasta="tests/data/test.fa",
-    ...     chrom_sizes="tests/data/test.chrom.sizes",
-    ... )
-    >>> print(genome.fasta)
-    <pysam.libcfaidx.FastaFile at 0x7f4d8b4a8f40>
-    >>> print(genome.chrom_sizes)
-    {'chr1': 1000, 'chr2': 2000}
-    >>> print(genome.name)
-    test
-
-    See Also
-    --------
-    crested.register_genome
     """
 
     def __init__(
@@ -87,6 +58,9 @@ class Genome:
             self._annotation = None
 
         self._name = name
+
+        # This will hold the entire genome sequences in memory (if loaded)
+        self._in_memory_sequences: dict[str, str] | None = None
 
     @property
     def fasta(self) -> FastaFile:
@@ -150,6 +124,18 @@ class Genome:
                 return basename
         return self._name
 
+    def to_memory(self) -> None:
+        """
+        Reads all sequences from the FASTA file into memory.
+        This stores a dictionary mapping chromosome names to their full sequence.
+        """
+        fasta = self.fasta  # Open the FASTA file using pysam
+        self._in_memory_sequences = {}
+        for chrom in fasta.references:
+            # Load the entire sequence for each chromosome.
+            self._in_memory_sequences[chrom] = fasta.fetch(reference=chrom)
+        logger.info("Genome sequences loaded into memory.")
+
     def fetch(self, chrom=None, start=None, end=None, strand="+", region=None) -> str:
         """
         Fetch a sequence from a genomic region.
@@ -184,16 +170,23 @@ class Genome:
                 chrom, start_end = region.split(":")
             start, end = map(int, start_end.split("-"))
 
-        if not (chrom and start and end):
-            raise ValueError(
-                "chrom/start/end must all be supplied to extract a sequence."
-            )
+        # Check that chrom, start, and end are provided (note that 0 is a valid start position)
+        if chrom is None or start is None or end is None:
+            raise ValueError("chrom, start, and end must all be supplied to extract a sequence.")
 
-        seq = self.fasta.fetch(reference=chrom, start=start, end=end)
+        # If sequences are loaded in memory, use them
+        if self._in_memory_sequences is not None:
+            try:
+                seq = self._in_memory_sequences[chrom][start:end]
+            except KeyError:
+                raise ValueError(f"Chromosome {chrom} not found in in-memory sequences.")
+        else:
+            seq = self.fasta.fetch(reference=chrom, start=start, end=end)
         if strand == "-":
             return reverse_complement(seq)
         else:
             return seq
+
 
 def _resolve_genome(
     genome: os.PathLike | Genome | None,

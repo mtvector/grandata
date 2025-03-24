@@ -1,6 +1,5 @@
 import numpy as np
 import torch
-import h5py
 import xbatcher
 import xarray as xr
 import os
@@ -114,7 +113,7 @@ class CrAnDataNode(BaseNode):
         return self.upstream.get_state()
 
 class RoundRobinNode(BaseNode):
-    def __init__(self, nodes, concat_dim='var', join='inner', num_workers=1):
+    def __init__(self, nodes, concat_dim='var', join='inner', num_workers=0):
         super().__init__()
         self.nodes = nodes
         self.concat_dim = concat_dim
@@ -214,9 +213,9 @@ class CrAnDataModule:
         """
         self.adata = CrAnData.open_zarr(self.adata.encoding['source'])#Reload from disk for sync
         state_idx = self.adata[self.split].compute()==state
-        cur_keys = list(self.adata.variables.keys())
-        loading_adata = self.adata[self.load_keys.keys()]
-        loading_adata = loading_adata.isel({self.batch_dim:state_idx}) if state != 'predict' else loading_adata
+        loading_adata = self.adata.isel({self.batch_dim:state_idx}) if state != 'predict' else self.adata
+        cur_keys = list(self.load_keys.keys())
+        loading_adata = loading_adata[cur_keys]
         
         dim_dict = dict(loading_adata.dims)
         dim_dict[self.batch_dim] = self.batch_size
@@ -301,7 +300,7 @@ class MetaCrAnDataModule:
         Initializes the xbatcher generators for each submodule for the given state.
     train_dataloader, val_dataloader, test_dataloader, predict_dataloader : property
     """
-    def __init__(self, adatas, batch_size, load_keys={'sequences':'sequences'}, shuffle=False, dnatransform=None, shuffle_dims=None, epoch_size=100000,batch_dim='var',num_workers=1,join='inner'):
+    def __init__(self, adatas, batch_size, load_keys={'sequences':'sequences'}, shuffle=False, dnatransform=None, shuffle_dims=None, epoch_size=100000,batch_dim='var',num_workers=0,join='inner'):
         self.batch_dim = batch_dim
         self.batch_size = batch_size
         self.shuffle = shuffle

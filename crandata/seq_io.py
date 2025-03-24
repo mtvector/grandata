@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 import json
+from tqdm import tqdm
 
 # Create a hot encoding table for DNA nucleotides (A, C, G, T)
 def get_hot_encoding_table(
@@ -72,7 +73,7 @@ def create_one_hot_encoded_array(
     if seq_length is None:
         seq_length = int(ranges_df.iloc[0]['end']) - int(ranges_df.iloc[0]['start'])
     
-    for idx, row in ranges_df.iterrows():
+    for idx, row in tqdm(ranges_df.iterrows(),total=ranges_df.shape[0]):
         chrom = row['chrom']
         start = int(row['start'])
         end = int(row['end'])
@@ -96,7 +97,6 @@ def create_one_hot_encoded_array(
     
     # Stack all sequences into a numpy array of shape (n_ranges, seq_length, 4)
     encoded_array = np.stack(sequences, axis=0)
-    
     # Create an xarray DataArray; we use dims ["var", "seq_len", "nuc"] where "nuc" has length 4.
     da = xr.DataArray(encoded_array, dims=["var", "seq_len", "nuc"])
     return da
@@ -127,14 +127,13 @@ def add_genome_sequences_to_crandata(adata: xr.Dataset, ranges_df: pd.DataFrame,
     """
     # Create the one-hot encoded DataArray.
     da = create_one_hot_encoded_array(ranges_df, genome, seq_length=seq_length)
-    
-    # Add the one-hot encoded array as a new data variable.
-    adata[key] = da
+
+    adata[key] = da.chunk({'var':adata.attrs['chunk_size'],'seq_len':seq_length,'nuc':4})
     
     # Store key genome metadata in the dataset's attributes.
     adata.attrs["genome_name"] = genome.name
     adata.attrs["genome_fasta"] = str(genome._fasta) if hasattr(genome, "_fasta") else None
-    adata.attrs["genome_chrom_sizes"] = json.dumps(genome.chrom_sizes) if len(genome.chrom_sizes.keys())<100 else None
+    adata.attrs["genome_chrom_sizes"] = json.dumps(genome.chrom_sizes) if len(genome.chrom_sizes.keys())<1000 else None
     
     return adata
 
@@ -343,5 +342,4 @@ class DNATransform:
             if rc_flags[i]:
                 sample = self.reverse_complement(sample)
             samples.append(sample)
-        print('samples',samples)
         return xr.concat(samples, dim="var")

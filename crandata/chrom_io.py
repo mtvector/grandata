@@ -120,8 +120,8 @@ def _create_temp_bed_file(consensus_peaks: pd.DataFrame, target_region_width: in
             axis=1,
         )
         adjusted_peaks[2] = adjusted_peaks[1] + target_region_width
-        adjusted_peaks[1] = adjusted_peaks[1].astype(int)
-        adjusted_peaks[2] = adjusted_peaks[2].astype(int)
+        adjusted_peaks[1] = adjusted_peaks[1].astype(np.int64)
+        adjusted_peaks[2] = adjusted_peaks[2].astype(np.int64)
     temp_bed_file = "temp_adjusted_regions.bed"
     adjusted_peaks.to_csv(temp_bed_file, sep="\t", header=False, index=False)
     return temp_bed_file
@@ -174,14 +174,12 @@ def _extract_values_from_bigwig(bw_file: Path, bed_file: Path, target: str,n_bin
     elif target == "raw":
         with pybigtools.open(bw_file, "r") as bw:
             lines = open(temp_bed_file.name).readlines()
-            # print("Temporary BED lines:", lines)
             values_list = [
                 np.array(
                     bw.values(chrom, int(start), int(end), missing=0., exact=False, bins=n_bins, summary='mean')
                 )
                 for chrom, start, end in [line.split("\t")[:3] for line in lines]
             ]
-            # print("Extracted values shapes:", [v.shape for v in values_list])
             values = np.vstack(values_list)
     else:
         raise ValueError(f"Unsupported target '{target}'")
@@ -199,7 +197,7 @@ def _extract_values_from_bigwig(bw_file: Path, bed_file: Path, target: str,n_bin
             return values
 
 def _add_x_to_ds(adata, bw_files, consensus_peaks, target, target_region_width,
-                      obs_index, var_index, chunk_size=1024,n_bins=None):
+                      obs_index, var_index, chunk_size=2048,n_bins=None):
     """
     Write training data (extracted from bigWig files) to zarr store.
     Hackish use of low level zarr interface to stream data to disk then reload.
@@ -220,7 +218,7 @@ def _add_x_to_ds(adata, bw_files, consensus_peaks, target, target_region_width,
     adata['X'] = xr.DataArray(np.empty([n_obs,n_var,seq_len]), dims=["obs", "var", "seq_bins"],
                      coords={"obs": np.array(obs_index),
                              "var": np.array(var_index),
-                             "seq_bins": np.arange(seq_len)})
+                             "seq_bins": np.arange(seq_len)},).chunk({'obs':n_obs,'var':chunk_size,'seq_bins':seq_len})
     
     store_path = adata.encoding['source']
     adata.to_zarr(store_path,mode='a')
@@ -245,12 +243,9 @@ def _add_x_to_ds(adata, bw_files, consensus_peaks, target, target_region_width,
     
         if result.ndim == 1:
             result = result.reshape(n_var, 1)
-    
         # Directly assign the chunk into the Zarr array
         store['X'][i, :, :] = result.astype('float32')
     
-    adata = CrAnData.open_zarr(store_path)        
-
 def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
                    backed_path: Path, target_region_width: int | None,
                    target: str = 'raw',  # e.g. "raw", "mean", "max", etc.
@@ -313,6 +308,9 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
     )
     var_df = consensus_peaks.set_index("region")
     var_df["chunk_index"] = np.arange(var_df.shape[0]) // chunk_size
+    var_df["start"] = var_df["start"].astype('uint64')
+    var_df["end"] = var_df["end"].astype('uint64')
+    var_df["chunk_index"] = var_df["chunk_index"].astype('uint64')
     extra_vars = {}
     for col in obs_df.columns:
         extra_vars[f"obs-_-{col}"] = xr.DataArray(obs_df[col].values, dims=["obs"])
@@ -332,15 +330,15 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
         obs_index=obs_df.index, var_index=var_df.index,
         chunk_size=chunk_size, n_bins=n_bins
     )
-    # Add extra variables as before.
-    adata.attrs["params"] = json.dumps({
-        'target_region_width': target_region_width,
-        'shifted_region_width': target_region_width + 2 * max_stochastic_shift,
-        'max_stochastic_shift': max_stochastic_shift,
-        'chunk_size': chunk_size
-    })
-    adata.to_zarr(str(backed_path),mode='w')
-    adata = CrAnData.open_zarr(str(backed_path))        
+    adata.attrs['target_region_width'] = target_region_width
+    adata.attrs['shifted_region_width'] = target_region_width + 2 * max_stochastic_shift
+    adata.attrs['max_stochastic_shift'] = max_stochastic_shift
+    adata.attrs['chunk_size'] = chunk_size
+    adata['X'] = adata['X'].chunk({'obs':adata.dims['obs'],'var':chunk_size,'seq_bins':adata.dims['seq_bins']}) #enforce the same as before
+    # print('X chunks',adata['X'].chunksizes)
+
+    adata.to_zarr(str(backed_path),mode='a')
+    adata = CrAnData.open_zarr(str(backed_path))
     return adata
 
 # -----------------------
@@ -411,8 +409,8 @@ def add_contact_strengths_to_varp(adata, bedp_files, key="hic_contacts"):
     # if "chrom" not in adata.sizes['var']columns:
     #     var_index = adata['var-_-index'].astype(str)
     #     adata.var["chrom"] = var_index.str.split(":").str[0]
-    #     adata.var["start"] = var_index.str.split(":").str[1].str.split("-").str[0].astype(int)
-    #     adata.var["end"] = var_index.str.split(":").str[1].str.split("-").str[1].astype(int)
+    #     adata.var["start"] = var_index.str.split(":").str[1].str.split("-").str[0].astype(np.int64)
+    #     adata.var["end"] = var_index.str.split(":").str[1].str.split("-").str[1].astype(np.int64)
     
     chrom_intervals = prepare_intervals(adata)
     num_bins = adata.sizes['var']
