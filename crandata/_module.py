@@ -216,8 +216,7 @@ class CrAnDataModule:
         loading_adata = self.adata.isel({self.batch_dim:state_idx}) if state != 'predict' else self.adata
         cur_keys = list(self.load_keys.keys())
         loading_adata = loading_adata[cur_keys]
-        
-        dim_dict = dict(loading_adata.dims)
+        dim_dict = dict(loading_adata.sizes) #for futurewarning
         dim_dict[self.batch_dim] = self.batch_size
         # os.makedirs(self.cache_dir,exist_ok=True)
         # cache_store = zarr.storage.LocalStore(self.cache_dir)

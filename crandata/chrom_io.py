@@ -308,9 +308,9 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
     )
     var_df = consensus_peaks.set_index("region")
     var_df["chunk_index"] = np.arange(var_df.shape[0]) // chunk_size
-    var_df["start"] = var_df["start"].astype('uint64')
-    var_df["end"] = var_df["end"].astype('uint64')
-    var_df["chunk_index"] = var_df["chunk_index"].astype('uint64')
+    var_df["start"] = var_df["start"].astype('int64')
+    var_df["end"] = var_df["end"].astype('int64')
+    var_df["chunk_index"] = var_df["chunk_index"].astype('int64')
     extra_vars = {}
     for col in obs_df.columns:
         extra_vars[f"obs-_-{col}"] = xr.DataArray(obs_df[col].values, dims=["obs"])
@@ -330,6 +330,9 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
         obs_index=obs_df.index, var_index=var_df.index,
         chunk_size=chunk_size, n_bins=n_bins
     )
+
+    adata.attrs['chromsizes_file'] = str(chromsizes_file)
+    adata.attrs['target'] = target
     adata.attrs['target_region_width'] = target_region_width
     adata.attrs['shifted_region_width'] = target_region_width + 2 * max_stochastic_shift
     adata.attrs['max_stochastic_shift'] = max_stochastic_shift
