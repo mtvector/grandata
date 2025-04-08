@@ -3,6 +3,9 @@ import pandas as pd
 import numpy as np
 import os
 import json
+import zarr
+import icechunk as ic
+from icechunk.xarray import to_icechunk
 
 try:
     import sparse  # for sparse multidimensional arrays
@@ -10,12 +13,62 @@ except ImportError:
     print("no sparse")
     sparse = None
 
+# from zarr.storage import WrapperStore
+# import asyncio
+# from zarr.core.sync import sync
+# class LastChunkCacheStore(WrapperStore):
+#     """
+#     A store wrapper that caches the most recently loaded full chunk for each key in memory.
+#     When get() is called with a key and no byte_range (i.e. a full-chunk request), the wrapper
+#     checks whether that key has been previously fetched. If so, it returns the cached chunk;
+#     otherwise, it fetches from the underlying store and caches the result.
+#     """
+#     def __init__(self, store):
+#         super().__init__(store)
+#         self._cache = {}  # cache per key
+
+#     # Synchronous version for use by xarray's sync API:
+#     def get(self, key: str, prototype=None, byte_range=None):
+#         # Bypass caching for consolidated metadata.
+#         if key == "zarr.consolidated":
+#             v = self._store.get(key, prototype, byte_range)
+#             if asyncio.iscoroutine(v):
+#                 return sync(v)
+#             return v
+
+#         print("Synchronous get for key:", key)
+#         # Only cache full-chunk requests.
+#         if byte_range is None and key in self._cache:
+#             print("Returning cached value for:", key)
+#             return self._cache[key]
+
+#         # Get the value from the underlying store.
+#         value = self._store.get(key, prototype, byte_range)
+#         if asyncio.iscoroutine(value):
+#             value = sync(value)
+#         # If it's a full-chunk request, cache it.
+#         if byte_range is None:
+#             self._cache[key] = value
+#         return value
+
+#     async def get(self, key: str, prototype=None, byte_range=None):
+#         if key == "zarr.consolidated":
+#             return await self._store.get(key, prototype, byte_range)
+#         print("Async aget for key:", key)
+#         if byte_range is None and key in self._cache:
+#             return self._cache[key]
+#         value = await self._store.get(key, prototype, byte_range)
+#         if byte_range is None:
+#             self._cache[key] = value
+#         return value
+
 class CrAnData(xr.Dataset):
-    __slots__ = ("__dict__",)  # remove always_convert_df from slots
+    __slots__ = ("__dict__","session","repo")  # remove always_convert_df from slots
 
     def __init__(self, 
                  data_vars=None,
                  coords=None,
+                 session=None,
                  **kwargs):
         """
         Create a CrAnData object as a thin wrapper of xarray.Dataset.
@@ -23,6 +76,8 @@ class CrAnData(xr.Dataset):
         as a grouped dataframe (the separator is -_- ...idk).
         Also automatically stores and reloads sparse arrays.
         """
+        self.session = None
+        self.repo = None
         if data_vars is None:
             data_vars = {}
         # Merge any additional kwargs.
@@ -138,24 +193,62 @@ class CrAnData(xr.Dataset):
                 del new_vars[key]
         return cls(data_vars=new_vars, coords=obj.coords)
                 
-    @classmethod
-    def open_dataset(cls, path, **kwargs):
-        ds = xr.open_dataset(path, **kwargs)
-        encoding = ds.encoding
-        attrs = ds.attrs
-        obj = cls(data_vars=ds.data_vars, coords=ds.coords, always_convert_df=always_convert_df)
-        obj = cls._decode_sparse_from_vars(obj)
-        obj.encoding = encoding
-        obj.attrs = attrs
-        return obj
+    # @classmethod
+    # def open_dataset(cls, path, **kwargs):
+    #     ds = xr.open_dataset(path, **kwargs)
+    #     encoding = ds.encoding
+    #     attrs = ds.attrs
+    #     obj = cls(data_vars=ds.data_vars, coords=ds.coords, always_convert_df=always_convert_df)
+    #     obj = cls._decode_sparse_from_vars(obj)
+    #     obj.encoding = encoding
+    #     obj.attrs = attrs
+    #     return obj
 
     @classmethod
-    def open_zarr(cls, store, **kwargs):
-        ds = xr.open_zarr(store, **kwargs)
-        encoding = ds.encoding
-        attrs = ds.attrs
+    def open_zarr(cls, store, cache_config={'num_bytes_chunks':int(1e9)}, **kwargs):
+        '''store must be either path to zarr store or icechunk repo'''
+        if isinstance(store, (str, os.PathLike)):
+            store_path = store
+            storage_config = ic.local_filesystem_storage(store_path)
+            config = ic.RepositoryConfig.default()
+            config.caching = ic.CachingConfig(**cache_config)
+            if not ic.Repository.exists(storage_config):
+                repo = ic.Repository.create(storage_config,confi)
+            else:
+                repo = ic.Repository.open(storage_config, config)
+        else:
+            repo = store
+        session = repo.readonly_session("main")
+            # store_path = session.store.attrs["source"] #TODO test this = it doesn't work
+        ds = xr.open_zarr(session.store, consolidated=False, **kwargs)
+        # Save the store path in the attributes or as a separate property.
+        # ds.attrs["source"] = store_path
         obj = cls(data_vars=ds.data_vars, coords=ds.coords)
-        obj = cls._decode_sparse_from_vars(obj)
-        obj.encoding = encoding
-        obj.attrs = attrs
+        obj.encoding = ds.encoding
+        obj.attrs = ds.attrs
+        obj.session = session
+        obj.repo = repo
         return obj
+
+    def make_write_session(self):
+        self.session = self.repo.writable_session("main")
+    
+    def to_icechunk(self,store=None,commit_name="commit_", cache_config={}, **kwargs):
+        if store is not None:
+            if isinstance(store, (str, os.PathLike)):
+                store_path = store
+                storage_config = ic.local_filesystem_storage(store_path)
+                config = ic.RepositoryConfig.default()
+                config.caching = ic.CachingConfig(**cache_config)
+                if not ic.Repository.exists(storage_config):
+                    self.repo = ic.Repository.create(storage_config,config)
+                else:
+                    self.repo = ic.Repository.open(storage_config, config)
+            else:
+                self.repo = store
+        write_session = self.repo.writable_session("main")
+        repo = self.repo
+        to_icechunk(self,write_session,**kwargs)
+        write_session.commit(commit_name)
+        self.session = self.repo.readonly_session("main")
+    #TODO Implement open_s3_zarr if we want this later

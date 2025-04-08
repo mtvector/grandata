@@ -1,12 +1,10 @@
 import numpy as np
-import torch
 import xbatcher
 import xarray as xr
 import os
 import zarr
 from .crandata import CrAnData
-import torch
-from torchdata.nodes import BaseNode, Loader, IterableWrapper, ParallelMapper
+from torchdata.nodes import BaseNode, Loader, IterableWrapper, ParallelMapper#,Prefetcher
 
 
 def _reindex_array(array, local_obs, global_obs):
@@ -41,11 +39,13 @@ class TensorConversionNode(BaseNode):
         If True, converts variables to numpy arrays; otherwise converts to torch.Tensor.
         (Default is False.)
     """
-    def __init__(self, upstream, load_keys, as_numpy=False):
+    def __init__(self, upstream, load_keys, as_numpy=True):
         super().__init__()
         self.upstream = upstream
         self.load_keys = load_keys
         self.as_numpy = as_numpy
+        if not as_numpy:
+            import torch
 
     def reset(self, initial_state=None):
         self.upstream.reset(initial_state)
@@ -211,7 +211,7 @@ class CrAnDataModule:
         Set up the xbatcher generator for a given state.
         (It is assumed that the CrAnData object already has appropriate sample probabilities.)
         """
-        self.adata = CrAnData.open_zarr(self.adata.encoding['source'])#Reload from disk for sync
+        self.adata = CrAnData.open_zarr(self.adata.repo)#Reload from disk for sync
         state_idx = self.adata[self.split].compute()==state
         loading_adata = self.adata.isel({self.batch_dim:state_idx}) if state != 'predict' else self.adata
         cur_keys = list(self.load_keys.keys())
@@ -219,7 +219,6 @@ class CrAnDataModule:
         dim_dict = dict(loading_adata.sizes) #for futurewarning
         dim_dict[self.batch_dim] = self.batch_size
         # os.makedirs(self.cache_dir,exist_ok=True)
-        # cache_store = zarr.storage.LocalStore(self.cache_dir)
         self._generators[state] = xbatcher.BatchGenerator(
             ds=loading_adata,
             input_dims=dim_dict,
@@ -242,12 +241,17 @@ class CrAnDataModule:
     @property
     def predict_dataloader(self):
         return self._get_dataloader("predict")
+
+    def load(self):
+        """load module's dataset to memory"""
+        self.adata.load()
         
     def _get_dataloader(self, state: str):
         node = CrAnDataNode(self._generators[state], state=state,
                                  instructions=self.instructions, dnatransform=self.dnatransform, 
                                  shuffle_dims=self.shuffle_dims)
         node = TensorConversionNode(node, self.load_keys)
+        # node = Prefetcher(node, prefetch_factor=4)
         return Loader(node)
 
     def __repr__(self):
@@ -346,6 +350,11 @@ class MetaCrAnDataModule:
         multi_node = TensorConversionNode(multi_node, self.load_keys)
         return Loader(multi_node)
 
+    def load(self):
+        """load all modules' datasets to memory"""
+        for m in self.modules:
+            m.adata.load()
+    
     @property
     def train_dataloader(self):
         return self._get_dataloader("train", RoundRobinNode)

@@ -18,6 +18,8 @@ import h5py  # for HDF5 backing
 from . import crandata
 from .crandata import CrAnData
 import zarr
+import icechunk as ic
+from icechunk.xarray import to_icechunk
 
 # -----------------------
 # Utility functions
@@ -197,45 +199,58 @@ def _extract_values_from_bigwig(bw_file: Path, bed_file: Path, target: str,n_bin
             return values
 
 def _add_x_to_ds(adata, bw_files, consensus_peaks, target, target_region_width,
-                      obs_index, var_index, chunk_size=2048,n_bins=None):
+                 obs_index, var_index, chunk_size=2048, n_bins=None):
     """
-    Write training data (extracted from bigWig files) to zarr store.
-    Hackish use of low level zarr interface to stream data to disk then reload.
-    The final shape is (n_obs, n_var, seq_len).
+    Write training data (extracted from bigWig files) to a Zarr store (using zarr3)
+    backed by an icechunk store. The final shape is (n_obs, n_var, seq_len).
     """
     n_obs = len(bw_files)
     n_var = consensus_peaks.shape[0]
     
     # Determine sequence length using the first file.
     temp_bed = _create_temp_bed_file(consensus_peaks, target_region_width)
-    sample = _extract_values_from_bigwig(bw_files[0], temp_bed, target=target,n_bins=n_bins)
+    sample = _extract_values_from_bigwig(bw_files[0], temp_bed, target=target, n_bins=n_bins)
     os.remove(temp_bed)
+    
     if sample.ndim == 1:
         sample = sample.reshape(n_var, 1)
     seq_len = sample.shape[1]
     chunk_size = min(chunk_size, n_var)
-
-    adata['X'] = xr.DataArray(np.empty([n_obs,n_var,seq_len]), dims=["obs", "var", "seq_bins"],
-                     coords={"obs": np.array(obs_index),
-                             "var": np.array(var_index),
-                             "seq_bins": np.arange(seq_len)},).chunk({'obs':n_obs,'var':chunk_size,'seq_bins':seq_len})
     
-    store_path = adata.encoding['source']
-    adata.to_zarr(store_path,mode='a')
+    # Create an xarray DataArray for metadata and structure.
+    adata['X'] = xr.DataArray(
+        np.empty((n_obs, n_var, seq_len)),
+        dims=["obs", "var", "seq_bins"],
+        coords={
+            "obs": np.array(obs_index),
+            "var": np.array(var_index),
+            "seq_bins": np.arange(seq_len)
+        }
+    ).chunk({'obs': n_obs, 'var': chunk_size, 'seq_bins': seq_len})
     
-    # Open the Zarr store directly for chunk-wise writes
-    store = zarr.open(store_path, mode='a')
+    # Use the icechunk-backed store from the session.
+    adata.session = adata.repo.writable_session("main")
+    store = adata.session.store
+    # Open (or create) a Zarr group on the store in append mode.
+    group = zarr.open_group(store, mode='a')
     
-    # Explicitly create the "X" dataset if not already present
-    if 'X' not in store:
-        store.create_dataset(
-            'X', shape=(n_obs, n_var, seq_len),
+    # Create the "X" array in the group if it doesn't already exist.
+    if 'X' not in group:
+        array = group.create(
+            # store=store,
+            name='X',
+            shape=(n_obs, n_var, seq_len),
             chunks=(n_obs, chunk_size, seq_len),
             dtype='float32',
             fill_value=np.nan
         )
+        # Manually set the dimension metadata so that icechunk/xarray can properly match
+        # the dimensions to the chunk sizes.
+        array.attrs["_ARRAY_DIMENSIONS"] = ["obs", "var", "seq_bins"]
+    else:
+        array = group['X']
     
-    # Write data chunk-wise directly to Zarr store
+    # Write data chunk-wise directly to the Zarr store.
     for i, bw_file in tqdm(enumerate(bw_files), total=n_obs):
         temp_bed = _create_temp_bed_file(consensus_peaks, target_region_width)
         result = _extract_values_from_bigwig(bw_file, temp_bed, target=target, n_bins=n_bins)
@@ -243,8 +258,9 @@ def _add_x_to_ds(adata, bw_files, consensus_peaks, target, target_region_width,
     
         if result.ndim == 1:
             result = result.reshape(n_var, 1)
-        # Directly assign the chunk into the Zarr array
-        store['X'][i, :, :] = result.astype('float32')
+        # Write the computed result to the corresponding slice of the Zarr array.
+        array[i, :, :] = result.astype('float32')
+    adata.session = adata.repo.readonly_session("main")
     
 def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
                    backed_path: Path, target_region_width: int | None,
@@ -318,11 +334,9 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
     for col in var_df.columns:
         extra_vars[f"var-_-{col}"] = xr.DataArray(var_df[col].values, dims=["var"])
     extra_vars["var-_-index"] = xr.DataArray(var_df.index.values, dims=["var"])
-    
+
     adata = CrAnData(**extra_vars)
-    # os.makedirs(str(backed_path), exist_ok=False)
-    adata.to_zarr(str(backed_path),mode='w')
-    adata = CrAnData.open_zarr(str(backed_path))
+    adata.to_icechunk(str(backed_path),mode='a')
 
     X = _add_x_to_ds(
         adata,
@@ -338,9 +352,7 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
     adata.attrs['max_stochastic_shift'] = max_stochastic_shift
     adata.attrs['chunk_size'] = chunk_size
     adata['X'] = adata['X'].chunk({'obs':adata.dims['obs'],'var':chunk_size,'seq_bins':adata.dims['seq_bins']}) #enforce the same as before
-    # print('X chunks',adata['X'].chunksizes)
-
-    adata.to_zarr(str(backed_path),mode='a')
+    adata.to_icechunk(mode='a',commit_name='import_bigwigs')
     adata = CrAnData.open_zarr(str(backed_path))
     return adata
 
