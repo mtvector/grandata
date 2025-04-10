@@ -204,6 +204,10 @@ def _add_x_to_ds(adata, bw_files, consensus_peaks, target, target_region_width,
     Write training data (extracted from bigWig files) to a Zarr store (using zarr3)
     backed by an icechunk store. The final shape is (n_obs, n_var, seq_len).
     """
+    import psutil, os, time
+    process = psutil.Process(os.getpid())
+    print("Initial memory usage (bytes):", process.memory_info().rss)
+
     n_obs = len(bw_files)
     n_var = consensus_peaks.shape[0]
     
@@ -260,6 +264,9 @@ def _add_x_to_ds(adata, bw_files, consensus_peaks, target, target_region_width,
             result = result.reshape(n_var, 1)
         # Write the computed result to the corresponding slice of the Zarr array.
         array[i, :, :] = result.astype('float32')
+        print(f"After {i} files, memory usage (bytes):", process.memory_info().rss)
+        adata.to_icechunk(commit_name='append_bigwig_'+str(i),mode='a')
+        print(f"After {i} files (post-write), memory usage (bytes):", process.memory_info().rss)
     adata.session = adata.repo.readonly_session("main")
     
 def import_bigwigs(bigwigs_folder: Path, regions_file: Path,

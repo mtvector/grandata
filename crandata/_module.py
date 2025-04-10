@@ -211,7 +211,8 @@ class CrAnDataModule:
         Set up the xbatcher generator for a given state.
         (It is assumed that the CrAnData object already has appropriate sample probabilities.)
         """
-        self.adata = CrAnData.open_zarr(self.adata.repo)#Reload from disk for sync
+        print(self.adata,dir(self.adata))
+        # self.adata = CrAnData.open_zarr(self.adata.repo)#Reload from disk for sync
         state_idx = self.adata[self.split].compute()==state
         loading_adata = self.adata.isel({self.batch_dim:state_idx}) if state != 'predict' else self.adata
         cur_keys = list(self.load_keys.keys())

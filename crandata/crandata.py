@@ -234,6 +234,7 @@ class CrAnData(xr.Dataset):
         self.session = self.repo.writable_session("main")
     
     def to_icechunk(self,store=None,commit_name="commit_", cache_config={}, **kwargs):
+        '''store must be either path to zarr store or icechunk repo, not technically an icechunk store (ik, confusing)'''
         if store is not None:
             if isinstance(store, (str, os.PathLike)):
                 store_path = store
@@ -247,7 +248,6 @@ class CrAnData(xr.Dataset):
             else:
                 self.repo = store
         write_session = self.repo.writable_session("main")
-        repo = self.repo
         to_icechunk(self,write_session,**kwargs)
         write_session.commit(commit_name)
         self.session = self.repo.readonly_session("main")
