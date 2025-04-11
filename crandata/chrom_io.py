@@ -18,8 +18,6 @@ import h5py  # for HDF5 backing
 from . import crandata
 from .crandata import CrAnData
 import zarr
-import icechunk as ic
-from icechunk.xarray import to_icechunk
 
 # -----------------------
 # Utility functions
@@ -146,7 +144,7 @@ def _extract_values_from_bigwig(bw_file: Path, bed_file: Path, target: str,n_bin
     temp_bed_file.close()
     total_bed_entries = len(bed_entries_to_keep_idx)
     bed_entries_to_keep_idx = np.array(bed_entries_to_keep_idx, np.intp)
-    
+
     if target == "mean":
         with pybigtools.open(bw_file, "r") as bw:
             values = np.fromiter(
@@ -199,76 +197,55 @@ def _extract_values_from_bigwig(bw_file: Path, bed_file: Path, target: str,n_bin
             return values
 
 def _add_x_to_ds(adata, bw_files, consensus_peaks, target, target_region_width,
-                 obs_index, var_index, chunk_size=2048, n_bins=None):
+                      obs_index, var_index, chunk_size=2048,n_bins=None):
     """
-    Write training data (extracted from bigWig files) to a Zarr store (using zarr3)
-    backed by an icechunk store. The final shape is (n_obs, n_var, seq_len).
+    Write training data (extracted from bigWig files) to zarr store.
+    Hackish use of low level zarr interface to stream data to disk then reload.
+    The final shape is (n_obs, n_var, seq_len).
     """
-    import psutil, os, time
-    process = psutil.Process(os.getpid())
-    print("Initial memory usage (bytes):", process.memory_info().rss)
-
     n_obs = len(bw_files)
     n_var = consensus_peaks.shape[0]
-    
+
     # Determine sequence length using the first file.
     temp_bed = _create_temp_bed_file(consensus_peaks, target_region_width)
-    sample = _extract_values_from_bigwig(bw_files[0], temp_bed, target=target, n_bins=n_bins)
+    sample = _extract_values_from_bigwig(bw_files[0], temp_bed, target=target,n_bins=n_bins)
     os.remove(temp_bed)
-    
     if sample.ndim == 1:
         sample = sample.reshape(n_var, 1)
     seq_len = sample.shape[1]
     chunk_size = min(chunk_size, n_var)
-    
-    # Create an xarray DataArray for metadata and structure.
-    adata['X'] = xr.DataArray(
-        np.empty((n_obs, n_var, seq_len)),
-        dims=["obs", "var", "seq_bins"],
-        coords={
-            "obs": np.array(obs_index),
-            "var": np.array(var_index),
-            "seq_bins": np.arange(seq_len)
-        }
-    ).chunk({'obs': n_obs, 'var': chunk_size, 'seq_bins': seq_len})
-    
-    # Use the icechunk-backed store from the session.
-    adata.session = adata.repo.writable_session("main")
-    store = adata.session.store
-    # Open (or create) a Zarr group on the store in append mode.
-    group = zarr.open_group(store, mode='a')
-    
-    # Create the "X" array in the group if it doesn't already exist.
-    if 'X' not in group:
-        array = group.create(
-            # store=store,
-            name='X',
-            shape=(n_obs, n_var, seq_len),
+
+    adata['X'] = xr.DataArray(np.empty([n_obs,n_var,seq_len]), dims=["obs", "var", "seq_bins"],
+                     coords={"obs": np.array(obs_index),
+                             "var": np.array(var_index),
+                             "seq_bins": np.arange(seq_len)},).chunk({'obs':n_obs,'var':chunk_size,'seq_bins':seq_len})
+
+    store_path = adata.encoding['source']
+    adata.to_zarr(store_path,mode='a')
+
+    # Open the Zarr store directly for chunk-wise writes
+    store = zarr.open(store_path, mode='a')
+
+    # Explicitly create the "X" dataset if not already present
+    if 'X' not in store:
+        store.create_dataset(
+            'X', shape=(n_obs, n_var, seq_len),
             chunks=(n_obs, chunk_size, seq_len),
             dtype='float32',
             fill_value=np.nan
         )
-        # Manually set the dimension metadata so that icechunk/xarray can properly match
-        # the dimensions to the chunk sizes.
-        array.attrs["_ARRAY_DIMENSIONS"] = ["obs", "var", "seq_bins"]
-    else:
-        array = group['X']
-    
-    # Write data chunk-wise directly to the Zarr store.
+
+    # Write data chunk-wise directly to Zarr store
     for i, bw_file in tqdm(enumerate(bw_files), total=n_obs):
         temp_bed = _create_temp_bed_file(consensus_peaks, target_region_width)
         result = _extract_values_from_bigwig(bw_file, temp_bed, target=target, n_bins=n_bins)
         os.remove(temp_bed)
-    
+
         if result.ndim == 1:
             result = result.reshape(n_var, 1)
-        # Write the computed result to the corresponding slice of the Zarr array.
-        array[i, :, :] = result.astype('float32')
-        print(f"After {i} files, memory usage (bytes):", process.memory_info().rss)
-        adata.to_icechunk(commit_name='append_bigwig_'+str(i),mode='a')
-        print(f"After {i} files (post-write), memory usage (bytes):", process.memory_info().rss)
-    adata.session = adata.repo.readonly_session("main")
-    
+        # Directly assign the chunk into the Zarr array
+        store['X'][i, :, :] = result.astype('float32')
+
 def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
                    backed_path: Path, target_region_width: int | None,
                    target: str = 'raw',  # e.g. "raw", "mean", "max", etc.
@@ -285,14 +262,14 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
         raise FileNotFoundError(f"Directory '{bigwigs_folder}' not found")
     if not regions_file.is_file():
         raise FileNotFoundError(f"File '{regions_file}' not found")
-    
+
     # Read chromosome sizes.
     chromsizes_dict = None
     if chromsizes_file is not None:
         chromsizes_dict = _read_chromsizes(chromsizes_file)
     if genome is not None:
         chromsizes_dict = genome.chrom_sizes
-    
+
     _check_bed_file_format(regions_file)
     consensus_peaks = _read_consensus_regions(regions_file, chromsizes_dict)
     region_width = int(np.round(np.mean(consensus_peaks['end'] - consensus_peaks['start'])))
@@ -300,7 +277,7 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
     consensus_peaks = _filter_and_adjust_chromosome_data(consensus_peaks, chromsizes_dict, max_shift=max_stochastic_shift)
     shifted_width = target_region_width + 2 * max_stochastic_shift
     consensus_peaks = consensus_peaks.loc[(consensus_peaks['end'] - consensus_peaks['start']) == shifted_width, :]
-    
+
     # Collect valid bigWig files.
     bw_files = []
     chrom_set = set([])  # Start with no chromosomes
@@ -322,7 +299,7 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
     bw_files = sorted(bw_files)
     if not bw_files:
         raise FileNotFoundError(f"No valid bigWig files found in '{bigwigs_folder}'")
-    
+
     logger.info(f"Extracting values from {len(bw_files)} bigWig files...")
     # Build obs and var DataFrames.
     obs_df = pd.DataFrame(
@@ -343,7 +320,9 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
     extra_vars["var-_-index"] = xr.DataArray(var_df.index.values, dims=["var"])
 
     adata = CrAnData(**extra_vars)
-    adata.to_icechunk(str(backed_path),mode='a')
+    # os.makedirs(str(backed_path), exist_ok=False)
+    adata.to_zarr(str(backed_path),mode='w')
+    adata = CrAnData.open_zarr(str(backed_path))
 
     X = _add_x_to_ds(
         adata,
@@ -359,7 +338,9 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
     adata.attrs['max_stochastic_shift'] = max_stochastic_shift
     adata.attrs['chunk_size'] = chunk_size
     adata['X'] = adata['X'].chunk({'obs':adata.dims['obs'],'var':chunk_size,'seq_bins':adata.dims['seq_bins']}) #enforce the same as before
-    adata.to_icechunk(mode='a',commit_name='import_bigwigs')
+    # print('X chunks',adata['X'].chunksizes)
+
+    adata.to_zarr(str(backed_path),mode='a')
     adata = CrAnData.open_zarr(str(backed_path))
     return adata
 
@@ -378,7 +359,7 @@ def prepare_intervals(adata):
         "end": adata["var-_-end"].data
     }, index=adata['var-_-index'].data)
     df = df.sort_values(["chrom", "start"])
-    
+
     chrom_intervals = defaultdict(list)
     for idx, row in df.iterrows():
         chrom_intervals[row["chrom"]].append((row["start"], row["end"], idx))
@@ -433,24 +414,24 @@ def add_contact_strengths_to_varp(adata, bedp_files, key="hic_contacts"):
     #     adata.var["chrom"] = var_index.str.split(":").str[0]
     #     adata.var["start"] = var_index.str.split(":").str[1].str.split("-").str[0].astype(np.int64)
     #     adata.var["end"] = var_index.str.split(":").str[1].str.split("-").str[1].astype(np.int64)
-    
+
     chrom_intervals = prepare_intervals(adata)
     num_bins = adata.sizes['var']
     num_files = len(bedp_files)
     var_name_to_i = {v: i for i, v in enumerate(adata['var-_-index'].data)}
-    
+
     all_rows = []
     all_cols = []
     all_file_idx = []
     all_data = []
-    
+
     for fidx, bedp_file in enumerate(bedp_files):
         bedp_df = pd.read_csv(
             bedp_file, sep="\t", header=None,
             names=["chr1", "start1", "end1", "chr2", "start2", "end2", "score"]
         ).reset_index(drop=True)
         bedp_df["row_idx"] = bedp_df.index
-        
+
         # Process first coordinate.
         bedp_first = (
             bedp_df[["chr1", "start1", "end1", "row_idx"]]
@@ -465,10 +446,10 @@ def add_contact_strengths_to_varp(adata, bedp_files, key="hic_contacts"):
             .sort_values(["chrom", "start"])
             .reset_index(drop=True)
         )
-        
+
         overlaps_first = _find_overlaps_in_sorted_bed(bedp_first, chrom_intervals)
         overlaps_second = _find_overlaps_in_sorted_bed(bedp_second, chrom_intervals)
-        
+
         for row_idx, row in bedp_df.iterrows():
             ovs1 = overlaps_first.get(row_idx, [])
             ovs2 = overlaps_second.get(row_idx, [])
@@ -482,7 +463,7 @@ def add_contact_strengths_to_varp(adata, bedp_files, key="hic_contacts"):
                     all_cols.append(j_idx)
                     all_file_idx.append(fidx)
                     all_data.append(float(row["score"]))
-    
+
     if all_rows:
         all_rows = np.array(all_rows, dtype=np.int64)
         all_cols = np.array(all_cols, dtype=np.int64)
@@ -493,11 +474,11 @@ def add_contact_strengths_to_varp(adata, bedp_files, key="hic_contacts"):
         all_cols = np.array([0], dtype=np.int64)
         all_file_idx = np.array([0], dtype=np.int64)
         all_data = np.array([0], dtype=np.float32)
-    
+
     size = (num_bins, num_bins, num_files)
     indices = np.stack([all_rows, all_cols, all_file_idx], axis=0)
     contacts_tensor = sparse.COO(indices, all_data, shape=size)
-    
+
     contacts_xr = xr.DataArray(
         contacts_tensor,
         dims=["var", "var_1", "obs"],
@@ -508,4 +489,3 @@ def add_contact_strengths_to_varp(adata, bedp_files, key="hic_contacts"):
         }
     )
     adata[f"varp-_-{key}"] = contacts_xr
-    return contacts_xr

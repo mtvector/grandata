@@ -192,20 +192,20 @@ class CrAnData(xr.Dataset):
                 new_vars[orig_key] = xr.DataArray(decoded, dims=dims)
                 del new_vars[key]
         return cls(data_vars=new_vars, coords=obj.coords)
-                
-    # @classmethod
-    # def open_dataset(cls, path, **kwargs):
-    #     ds = xr.open_dataset(path, **kwargs)
-    #     encoding = ds.encoding
-    #     attrs = ds.attrs
-    #     obj = cls(data_vars=ds.data_vars, coords=ds.coords, always_convert_df=always_convert_df)
-    #     obj = cls._decode_sparse_from_vars(obj)
-    #     obj.encoding = encoding
-    #     obj.attrs = attrs
-    #     return obj
 
     @classmethod
-    def open_zarr(cls, store, cache_config={'num_bytes_chunks':int(1e9)}, **kwargs):
+    def open_zarr(cls, store, **kwargs):
+        ds = xr.open_zarr(store, **kwargs)
+        encoding = ds.encoding
+        attrs = ds.attrs
+        obj = cls(data_vars=ds.data_vars, coords=ds.coords)
+        obj = cls._decode_sparse_from_vars(obj)
+        obj.encoding = encoding
+        obj.attrs = attrs
+        return obj
+
+    @classmethod
+    def open_icechunk(cls, store, cache_config={'num_bytes_chunks':int(1e9)}, **kwargs):
         '''store must be either path to zarr store or icechunk repo'''
         if isinstance(store, (str, os.PathLike)):
             store_path = store
