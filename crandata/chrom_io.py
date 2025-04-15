@@ -180,7 +180,11 @@ def _extract_values_from_bigwig(bw_file: Path, bed_file: Path, target: str,n_bin
                 )
                 for chrom, start, end in [line.split("\t")[:3] for line in lines]
             ]
-            values = np.vstack(values_list)
+            if not values_list:
+                os.remove(temp_bed_file.name)
+                n_columns = n_bins if n_bins is not None else 1
+                return np.full((num_lines, n_columns), 0., dtype=np.float32)
+            values = np.vstack(values_list)   
     else:
         raise ValueError(f"Unsupported target '{target}'")
     os.remove(temp_bed_file.name)
@@ -197,60 +201,117 @@ def _extract_values_from_bigwig(bw_file: Path, bed_file: Path, target: str,n_bin
             return values
 
 def _add_x_to_ds(adata, bw_files, consensus_peaks, target, target_region_width,
-                      obs_index, var_index, chunk_size=2048,n_bins=None):
+                 obs_index, var_index, tile_size=20000, chunk_size=2048, n_bins=None,
+                 backend="zarr"):
     """
-    Write training data (extracted from bigWig files) to zarr store.
-    Hackish use of low level zarr interface to stream data to disk then reload.
-    The final shape is (n_obs, n_var, seq_len).
+    Write training data extracted from bigWig files to a store, using distinct parameters
+    for the in-memory tile size and on-disk chunk size. The final xarray DataArray 'X' has
+    shape (n_obs, n_var, seq_len).
+
+    Parameters:
+      adata              : Anndata object in which the 'X' data will be stored.
+      bw_files           : List of bigWig file paths (one per observation).
+      consensus_peaks    : Array-like of consensus peak definitions, shape (n_var, ...).
+      target             : Region specification passed to the extractor.
+      target_region_width: Width parameter defining the target region.
+      obs_index          : Array-like of observation identifiers.
+      var_index          : Array-like of consensus peak identifiers.
+      tile_size          : Number of consensus peaks per in-memory tile (for processing).
+      chunk_size         : On-disk chunk size along the 'var' axis for xarray/Dask and Zarr.
+      n_bins             : Optional parameter specifying the number of bins for bigWig extraction.
+      backend            : Either "zarr" or "icechunk". Determines which backend is used.
     """
     n_obs = len(bw_files)
     n_var = consensus_peaks.shape[0]
 
-    # Determine sequence length using the first file.
+    # Determine sequence length using the first bigWig file over all consensus peaks.
     temp_bed = _create_temp_bed_file(consensus_peaks, target_region_width)
-    sample = _extract_values_from_bigwig(bw_files[0], temp_bed, target=target,n_bins=n_bins)
+    sample = _extract_values_from_bigwig(bw_files[0], temp_bed, target=target, n_bins=n_bins)
     os.remove(temp_bed)
     if sample.ndim == 1:
         sample = sample.reshape(n_var, 1)
     seq_len = sample.shape[1]
-    chunk_size = min(chunk_size, n_var)
 
-    adata['X'] = xr.DataArray(np.empty([n_obs,n_var,seq_len]), dims=["obs", "var", "seq_bins"],
-                     coords={"obs": np.array(obs_index),
-                             "var": np.array(var_index),
-                             "seq_bins": np.arange(seq_len)},).chunk({'obs':n_obs,'var':chunk_size,'seq_bins':seq_len})
+    # Ensure tile_size does not exceed the number of consensus peaks.
+    tile_size = min(tile_size, n_var)
 
-    store_path = adata.encoding['source']
-    adata.to_zarr(store_path,mode='a')
+    # Create an xarray DataArray with on-disk chunking along the 'var' axis.
+    adata['X'] = xr.DataArray(
+        np.empty((n_obs, n_var, seq_len)),
+        dims=["obs", "var", "seq_bins"],
+        coords={
+            "obs": np.array(obs_index),
+            "var": np.array(var_index),
+            "seq_bins": np.arange(seq_len)
+        }
+    ).chunk({'obs': n_obs, 'var': chunk_size, 'seq_bins': seq_len})
 
-    # Open the Zarr store directly for chunk-wise writes
-    store = zarr.open(store_path, mode='a')
+    if backend == "zarr":
+        # Use the zarr store defined in adata.encoding.
+        store_path = adata.encoding['source']
+        adata.to_zarr(store_path, mode='a')
+        store = zarr.open(store_path, mode='a')
 
-    # Explicitly create the "X" dataset if not already present
-    if 'X' not in store:
-        store.create_dataset(
-            'X', shape=(n_obs, n_var, seq_len),
-            chunks=(n_obs, chunk_size, seq_len),
-            dtype='float32',
-            fill_value=np.nan
-        )
+        # Create the 'X' dataset if it doesn't exist.
+        if 'X' not in store:
+            store.create_dataset(
+                'X', shape=(n_obs, n_var, seq_len),
+                chunks=(n_obs, chunk_size, seq_len),
+                dtype='float32',
+                fill_value=np.nan
+            )
+        array = store['X']
 
-    # Write data chunk-wise directly to Zarr store
-    for i, bw_file in tqdm(enumerate(bw_files), total=n_obs):
-        temp_bed = _create_temp_bed_file(consensus_peaks, target_region_width)
-        result = _extract_values_from_bigwig(bw_file, temp_bed, target=target, n_bins=n_bins)
+    elif backend == "icechunk":
+        # Use the icechunk-backed store from the session.
+        adata.session = adata.repo.writable_session("main")
+        store = adata.session.store
+        group = zarr.open_group(store, mode='a')
+        if 'X' not in group:
+            array = group.create(
+                name='X',
+                shape=(n_obs, n_var, seq_len),
+                chunks=(n_obs, chunk_size, seq_len),
+                dtype='float32',
+                fill_value=np.nan
+            )
+            # Set dimension metadata so that icechunk/xarray matches chunk sizes.
+            array.attrs["_ARRAY_DIMENSIONS"] = ["obs", "var", "seq_bins"]
+        else:
+            array = group['X']
+    else:
+        raise ValueError("Unsupported backend. Use 'zarr' or 'icechunk'.")
+
+    # Loop over the consensus peaks in in-memory tiles.
+    for var_start in tqdm(range(0, n_var, tile_size), desc="Processing memory tiles"):
+        var_end = min(var_start + tile_size, n_var)
+        # Create a temporary BED file for the current tile of consensus peaks.
+        temp_bed = _create_temp_bed_file(consensus_peaks[var_start:var_end], target_region_width)
+
+        # For each bigWig file, extract data for the current tile and write it.
+        results = []
+        for obs_idx, bw_file in enumerate(bw_files):
+            result = _extract_values_from_bigwig(bw_file, temp_bed, target=target, n_bins=n_bins)
+            if result.ndim == 1:
+                result = result.reshape((var_end - var_start, seq_len))
+            results.append(result)
+        array[:, var_start:var_end, :] = np.stack(results,axis=0).astype('float32')
         os.remove(temp_bed)
 
-        if result.ndim == 1:
-            result = result.reshape(n_var, 1)
-        # Directly assign the chunk into the Zarr array
-        store['X'][i, :, :] = result.astype('float32')
+        # If using icechunk, commit the current tile.
+        # if backend == "icechunk":
+        #     adata.to_icechunk(commit_name=f'append_tile_{var_start}_{var_end}', mode='a')
+
+    if backend == "icechunk":
+        # Switch to a readonly session after writing is complete.
+        adata.session = adata.repo.readonly_session("main")
 
 def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
                    backed_path: Path, target_region_width: int | None,
                    target: str = 'raw',  # e.g. "raw", "mean", "max", etc.
                    chromsizes_file: Path | None = None, genome: any = None,
-                   max_stochastic_shift: int = 0, chunk_size: int = 512, n_bins: int = None) -> 'CrAnData':
+                   max_stochastic_shift: int = 0, chunk_size: int = 512, n_bins: int = None,
+                   backend='zarr',tile_size=5000) -> 'CrAnData':
     """
     Import bigWig files and consensus regions to create a backed CrAnData object.
     This function validates inputs, filters and adjusts consensus regions (using _filter_and_adjust_chromosome_data),
@@ -320,15 +381,18 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
     extra_vars["var-_-index"] = xr.DataArray(var_df.index.values, dims=["var"])
 
     adata = CrAnData(**extra_vars)
-    # os.makedirs(str(backed_path), exist_ok=False)
-    adata.to_zarr(str(backed_path),mode='w')
-    adata = CrAnData.open_zarr(str(backed_path))
+    if backend == 'icechunk':
+        adata.to_icechunk(str(backed_path),mode='w')
+    else:
+        adata.to_zarr(str(backed_path),mode='w')
+        adata = CrAnData.open_zarr(str(backed_path))
 
     X = _add_x_to_ds(
         adata,
         bw_files, consensus_peaks, target, target_region_width,
         obs_index=obs_df.index, var_index=var_df.index,
-        chunk_size=chunk_size, n_bins=n_bins
+        chunk_size=chunk_size, n_bins=n_bins,tile_size=tile_size,
+        backend=backend
     )
 
     adata.attrs['chromsizes_file'] = str(chromsizes_file)
@@ -339,9 +403,12 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
     adata.attrs['chunk_size'] = chunk_size
     adata['X'] = adata['X'].chunk({'obs':adata.dims['obs'],'var':chunk_size,'seq_bins':adata.dims['seq_bins']}) #enforce the same as before
     # print('X chunks',adata['X'].chunksizes)
-
-    adata.to_zarr(str(backed_path),mode='a')
-    adata = CrAnData.open_zarr(str(backed_path))
+    if backend=='icechunk':
+        adata.to_icechunk(mode='a',commit_name='import_bigwigs')
+        adata = CrAnData.open_icechunk(str(backed_path))
+    else:
+        adata.to_zarr(str(backed_path),mode='a')
+        adata = CrAnData.open_zarr(str(backed_path))
     return adata
 
 # -----------------------
@@ -481,10 +548,10 @@ def add_contact_strengths_to_varp(adata, bedp_files, key="hic_contacts"):
 
     contacts_xr = xr.DataArray(
         contacts_tensor,
-        dims=["var", "var_1", "obs"],
+        dims=["var", "var_target", "obs"],
         coords={
             "var": np.array(adata['var-_-index'].data),
-            "var_1": np.array(adata['var-_-index'].data),
+            "var_target": np.array(adata['var-_-index'].data),
             "obs": np.array([os.path.basename(x).replace('.bedp','') for x in bedp_files])
         }
     )

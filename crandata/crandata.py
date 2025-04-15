@@ -13,55 +13,6 @@ except ImportError:
     print("no sparse")
     sparse = None
 
-# from zarr.storage import WrapperStore
-# import asyncio
-# from zarr.core.sync import sync
-# class LastChunkCacheStore(WrapperStore):
-#     """
-#     A store wrapper that caches the most recently loaded full chunk for each key in memory.
-#     When get() is called with a key and no byte_range (i.e. a full-chunk request), the wrapper
-#     checks whether that key has been previously fetched. If so, it returns the cached chunk;
-#     otherwise, it fetches from the underlying store and caches the result.
-#     """
-#     def __init__(self, store):
-#         super().__init__(store)
-#         self._cache = {}  # cache per key
-
-#     # Synchronous version for use by xarray's sync API:
-#     def get(self, key: str, prototype=None, byte_range=None):
-#         # Bypass caching for consolidated metadata.
-#         if key == "zarr.consolidated":
-#             v = self._store.get(key, prototype, byte_range)
-#             if asyncio.iscoroutine(v):
-#                 return sync(v)
-#             return v
-
-#         print("Synchronous get for key:", key)
-#         # Only cache full-chunk requests.
-#         if byte_range is None and key in self._cache:
-#             print("Returning cached value for:", key)
-#             return self._cache[key]
-
-#         # Get the value from the underlying store.
-#         value = self._store.get(key, prototype, byte_range)
-#         if asyncio.iscoroutine(value):
-#             value = sync(value)
-#         # If it's a full-chunk request, cache it.
-#         if byte_range is None:
-#             self._cache[key] = value
-#         return value
-
-#     async def get(self, key: str, prototype=None, byte_range=None):
-#         if key == "zarr.consolidated":
-#             return await self._store.get(key, prototype, byte_range)
-#         print("Async aget for key:", key)
-#         if byte_range is None and key in self._cache:
-#             return self._cache[key]
-#         value = await self._store.get(key, prototype, byte_range)
-#         if byte_range is None:
-#             self._cache[key] = value
-#         return value
-
 class CrAnData(xr.Dataset):
     __slots__ = ("__dict__","session","repo")  # remove always_convert_df from slots
 
@@ -130,14 +81,6 @@ class CrAnData(xr.Dataset):
             return pd.DataFrame(cols, index=np.arange(expected))
         else:
             return None
-        
-    def __repr__(self):
-        rep = f"CrAnData object\nArray names: {self.array_names}\n"
-        rep += f"Coordinates: {list(self.coords.keys())}\n"
-        return rep
-        
-    def _repr_html_(self):
-        return self.__repr__()
     
     # === Sparse encoding/decoding methods ===
     @staticmethod
@@ -203,6 +146,12 @@ class CrAnData(xr.Dataset):
         obj.encoding = encoding
         obj.attrs = attrs
         return obj
+        
+    def append_zarr(self, **kwargs):
+        """to_zarr but use the stored source path"""
+        self.to_zarr(store=self.encoding['source'],**kwargs)
+        
+    #Use Xarray DataSet's built in to_zarr
 
     @classmethod
     def open_icechunk(cls, store, cache_config={'num_bytes_chunks':int(1e9)}, **kwargs):
@@ -251,4 +200,4 @@ class CrAnData(xr.Dataset):
         to_icechunk(self,write_session,**kwargs)
         write_session.commit(commit_name)
         self.session = self.repo.readonly_session("main")
-    #TODO Implement open_s3_zarr if we want this later
+    #TODO Implement open_s3_zarr if I want this later
