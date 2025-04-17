@@ -126,7 +126,7 @@ def _create_temp_bed_file(consensus_peaks: pd.DataFrame, target_region_width: in
     adjusted_peaks.to_csv(temp_bed_file, sep="\t", header=False, index=False)
     return temp_bed_file
 
-def _extract_values_from_bigwig(bw_file: Path, bed_file: Path, target: str,n_bins: int = None) -> np.ndarray:
+def _extract_values_from_bigwig(bw_file: Path, bed_file: Path, target: str,n_bins: int = None,fill_val=0.) -> np.ndarray:
     bw_file = str(bw_file)
     bed_file = str(bed_file)
     with pybigtools.open(bw_file, "r") as bw:
@@ -138,13 +138,14 @@ def _extract_values_from_bigwig(bw_file: Path, bed_file: Path, target: str,n_bin
         for idx, line in enumerate(fh):
             chrom = line.split("\t", 1)[0]
             num_lines +=1
-            if chrom in chromosomes_in_bigwig:
+            if True:#chrom in chromosomes_in_bigwig:
                 temp_bed_file.write(line.encode("utf-8"))
                 bed_entries_to_keep_idx.append(idx)
     temp_bed_file.close()
     total_bed_entries = len(bed_entries_to_keep_idx)
     bed_entries_to_keep_idx = np.array(bed_entries_to_keep_idx, np.intp)
-
+    n_columns = n_bins if n_bins is not None else 1
+    
     if target == "mean":
         with pybigtools.open(bw_file, "r") as bw:
             values = np.fromiter(
@@ -174,23 +175,21 @@ def _extract_values_from_bigwig(bw_file: Path, bed_file: Path, target: str,n_bin
     elif target == "raw":
         with pybigtools.open(bw_file, "r") as bw:
             lines = open(temp_bed_file.name).readlines()
-            values_list = [
-                np.array(
-                    bw.values(chrom, int(start), int(end), missing=0., exact=False, bins=n_bins, summary='mean')
-                )
-                for chrom, start, end in [line.split("\t")[:3] for line in lines]
-            ]
-            if not values_list:
-                os.remove(temp_bed_file.name)
-                n_columns = n_bins if n_bins is not None else 1
-                return np.full((num_lines, n_columns), 0., dtype=np.float32)
-            values = np.vstack(values_list)   
+            values = np.full((num_lines, n_columns), fill_val, dtype=np.float32)
+            for i,(chrom, start, end) in enumerate([line.split("\t")[:3] for line in lines]):
+                try:
+                    values[i,:] = np.array(
+                        bw.values(chrom, int(start), int(end), missing=fill_val, exact=False, bins=n_bins, summary='mean')
+                    )
+                except KeyError as e:
+                    # print(e)
+                    values[i,:] = fill_val
     else:
         raise ValueError(f"Unsupported target '{target}'")
     os.remove(temp_bed_file.name)
     if target == "raw":
         all_data = np.full((num_lines, values.shape[1]), np.nan, dtype=np.float32)
-        all_data[bed_entries_to_keep_idx, :] = values
+        all_data[bed_entries_to_keep_idx, :] = values[bed_entries_to_keep_idx, :]
         return all_data
     else:
         if values.shape[0] != total_bed_entries:
@@ -377,8 +376,8 @@ def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
         extra_vars[f"obs-_-{col}"] = xr.DataArray(obs_df[col].values, dims=["obs"])
     extra_vars["obs-_-index"] = xr.DataArray(obs_df.index.values, dims=["obs"])
     for col in var_df.columns:
-        extra_vars[f"var-_-{col}"] = xr.DataArray(var_df[col].values, dims=["var"])
-    extra_vars["var-_-index"] = xr.DataArray(var_df.index.values, dims=["var"])
+        extra_vars[f"var-_-{col}"] = xr.DataArray(var_df[col].values, dims=["var"]).chunk({'var':chunk_size})
+    extra_vars["var-_-index"] = xr.DataArray(var_df.index.values, dims=["var"]).chunk({'var':chunk_size})
 
     adata = CrAnData(**extra_vars)
     if backend == 'icechunk':

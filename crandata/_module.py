@@ -4,8 +4,8 @@ import xarray as xr
 import os
 import zarr
 from .crandata import CrAnData
-from torchdata.nodes import BaseNode, Loader, IterableWrapper, ParallelMapper#,Prefetcher
-
+from torchdata.nodes import BaseNode, Loader, Mapper, IterableWrapper, ParallelMapper,Prefetcher,PinMemory
+from concurrent.futures import ThreadPoolExecutor
 
 def _reindex_array(array, local_obs, global_obs):
     """
@@ -21,76 +21,44 @@ def _reindex_array(array, local_obs, global_obs):
             new_array[idx[0]] = array[i]
     return new_array
 
-class TensorConversionNode(BaseNode):
+class TensorConverter:
     """
-    A node that converts an upstream xarray.Dataset batch into a dictionary of tensors.
-    
-    This node renames the keys of the dataset's data variables according to a provided mapping 
-    (load_keys) and converts each variable into either a torch.Tensor or a numpy array.
-    This is useful for interfacing with neural networks that expect specific keyword argument names.
     
     Parameters
     ----------
-    upstream : BaseNode
-        The upstream node producing xarray.Dataset batches.
     load_keys : dict
         Mapping of original data variable names to new names.
     as_numpy : bool, optional
         If True, converts variables to numpy arrays; otherwise converts to torch.Tensor.
         (Default is False.)
     """
-    def __init__(self, upstream, load_keys, as_numpy=True):
-        super().__init__()
-        self.upstream = upstream
+    def __init__(self, load_keys, as_numpy=True):
         self.load_keys = load_keys
         self.as_numpy = as_numpy
         if not as_numpy:
             import torch
 
-    def reset(self, initial_state=None):
-        self.upstream.reset(initial_state)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        batch = next(self.upstream)
+    def __call__(self,batch):
         out = {}
         for key, val in self.load_keys.items():
             arr = batch[key].values
             out[val] = arr if self.as_numpy else torch.as_tensor(arr)
         return out
 
-    def get_state(self):
-        return self.upstream.get_state()
-
-class CrAnDataNode(BaseNode):
+class DNATransformApplicator:
     """
     A wrapper node that applies state-specific postprocessing to batches
     produced by an upstream node. The upstream node is expected to be a torchdata.nodes.BaseNode 
     (or wrapped via IterableWrapper) that yields raw batches. CrAnDataNode applies the processing
     (e.g. reverse complementing and shuffling) based on the given state instructions.
     """
-    def __init__(self, upstream, state="train", instructions=None, dnatransform=None, shuffle_dims=None):
-        super().__init__()
-        # upstream must be a node; if you have a module, wrap it with IterableWrapper first.
-        self.upstream = upstream  
+    def __init__(self, state="train", instructions=None, dnatransform=None, shuffle_dims=None):
         self.state = state
-        # instructions (a dict) controls state-specific behavior
         self.instructions = instructions or {}
         self.dnatransform = dnatransform
         self.shuffle_dims = shuffle_dims or []
 
-    def reset(self, initial_state=None):
-        self.upstream.reset(initial_state)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        # Get a batch from the upstream node
-        batch = next(self.upstream)
-
+    def __call__(self,batch):
         # Apply reverse complement processing if needed.
         if self.instructions.get("apply_rc") and self.dnatransform is not None and 'sequences' in batch.data_vars:
             start, end, rc_flags = self.dnatransform.get_window_indices_and_rc(batch['sequences'])
@@ -109,19 +77,26 @@ class CrAnDataNode(BaseNode):
                             batch.data_vars[var_name] = da.isel({dim: perm})
         return batch
 
-    def get_state(self):
-        return self.upstream.get_state()
-
-class RoundRobinNode(BaseNode):
-    def __init__(self, nodes, concat_dim='var', join='inner', num_workers=0):
+class RoundRobinNodeParallel(BaseNode):
+    """
+    A node that fetches batches in round-robin fashion from multiple nodes concurrently.
+    It uses a persistent ThreadPoolExecutor to map _get_next_batch on each underlying node,
+    and concatenates their results into a single xarray object.
+    """
+    def __init__(self, nodes, concat_dim='var', join='inner', num_workers=1):
         super().__init__()
         self.nodes = nodes
         self.concat_dim = concat_dim
         self.join = join
         self.num_workers = num_workers
+        if self.num_workers > 0:
+            self.executor = ThreadPoolExecutor(max_workers=self.num_workers)
+        else:
+            self.executor = None
 
     def reset(self, initial_state=None):
         super().reset(initial_state)
+        # self.nodes.reset(initial_state)
         for node in self.nodes:
             node.reset(initial_state)
 
@@ -129,25 +104,27 @@ class RoundRobinNode(BaseNode):
         return {i: node.get_state() for i, node in enumerate(self.nodes)}
 
     def _get_next_batch(self, node):
-        # Attempt to fetch the next batch; if exhausted, reset and try again.
+        """Fetch a batch from a given node, resetting it if exhausted."""
         try:
-            return next(node)
+            return next(node)#.load()
         except StopIteration:
             node.reset()
-            return next(node)
+            return next(node)#.load()
 
     def next(self):
-        # Use ParallelMapper to apply _get_next_batch to each node concurrently.
-        mapper = ParallelMapper(
-            source=IterableWrapper(self.nodes),
-            map_fn=self._get_next_batch,
-            num_workers=self.num_workers,
-            method="thread"
-        )
-        batches = list(mapper)
+        # If a thread pool is available, map concurrently over all nodes.
+        if self.executor is not None:
+            futures = [self.executor.submit(self._get_next_batch, node) for node in self.nodes]
+            batches = [future.result() for future in futures]
+        else:
+            batches = [self._get_next_batch(node) for node in self.nodes]
+        # Concatenate the batches along the provided dimension.
         return xr.concat(batches, dim=self.concat_dim, join=self.join)
 
 class SequentialNode(BaseNode):
+    """
+    Sequentially iterates over a list of nodes. Moves to the next node once the current is exhausted.
+    """
     def __init__(self, nodes):
         super().__init__()
         self.nodes = nodes
@@ -166,13 +143,10 @@ class SequentialNode(BaseNode):
         }
 
     def next(self):
-        # Loop until we find a node with data or we run out of nodes.
         while self.current < len(self.nodes):
             try:
-                # Attempt to fetch the next batch from the current node.
                 return next(self.nodes[self.current])
             except StopIteration:
-                # If exhausted, move to the next node.
                 self.current += 1
         raise StopIteration
 
@@ -250,7 +224,8 @@ class CrAnDataModule:
         node = CrAnDataNode(self._generators[state], state=state,
                                  instructions=self.instructions, dnatransform=self.dnatransform, 
                                  shuffle_dims=self.shuffle_dims)
-        node = TensorConversionNode(node, self.load_keys)
+        converter = TensorConverter(self.load_keys)
+        node = Mapper(node,map_fn=converter)
         # node = Prefetcher(node, prefetch_factor=4)
         return Loader(node)
 
@@ -335,19 +310,27 @@ class MetaCrAnDataModule:
         # Create a list of nodes (wrapped generators) for the given state.
         nodes = [IterableWrapper(mod._generators[state]) for mod in self.modules]
         # Depending on the type of aggregation, create the multi-node.
-        if node_type is RoundRobinNode:
-            multi_node = RoundRobinNode(
+        if node_type is RoundRobinNodeParallel:
+            multi_node = RoundRobinNodeParallel(
                 nodes, concat_dim=self.batch_dim, join=self.join, num_workers=self.num_workers
             )
         else:
             multi_node = node_type(nodes)
         # Wrap with the CrAnDataNode that applies state–dependent processing.
-        multi_node = CrAnDataNode(
-            multi_node, state=state,
+        # multi_node = CrAnDataNode(
+        #     multi_node, state=state,
+        #     instructions=self.instructions, dnatransform=self.dnatransform,
+        #     shuffle_dims=self.shuffle_dims
+        # )
+        transform_applicator = DNATransformApplicator(state=state,
             instructions=self.instructions, dnatransform=self.dnatransform,
             shuffle_dims=self.shuffle_dims
         )
-        multi_node = TensorConversionNode(multi_node, self.load_keys)
+        multi_node = Mapper(multi_node,map_fn=transform_applicator)
+        converter = TensorConverter(self.load_keys)
+        multi_node = Mapper(multi_node,map_fn=converter)
+        # multi_node = PinMemory(multi_node)
+        # multi_node = Prefetcher(multi_node, prefetch_factor=2)
         return Loader(multi_node)
 
     def load(self):
@@ -357,7 +340,7 @@ class MetaCrAnDataModule:
     
     @property
     def train_dataloader(self):
-        return self._get_dataloader("train", RoundRobinNode)
+        return self._get_dataloader("train", RoundRobinNodeParallel)
 
     @property
     def val_dataloader(self):

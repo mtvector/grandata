@@ -162,7 +162,7 @@ class CrAnData(xr.Dataset):
             config = ic.RepositoryConfig.default()
             config.caching = ic.CachingConfig(**cache_config)
             if not ic.Repository.exists(storage_config):
-                repo = ic.Repository.create(storage_config,confi)
+                repo = ic.Repository.create(storage_config,config)
             else:
                 repo = ic.Repository.open(storage_config, config)
         else:
@@ -201,3 +201,12 @@ class CrAnData(xr.Dataset):
         write_session.commit(commit_name)
         self.session = self.repo.readonly_session("main")
     #TODO Implement open_s3_zarr if I want this later
+
+    def unify_convert_chunks(self,out_path):
+        new_self = self.unify_chunks()
+        for k in new_self.keys():
+            new_self[k] = new_self[k].chunk({k:new_self.chunks[k] for k in new_self[k].dims})
+        if '.icechunk' in out_path:
+            new_self.to_icechunk(out_path,mode='w')
+        else:
+            new_self.to_zarr(out_path,mode='w')
