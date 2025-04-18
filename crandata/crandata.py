@@ -203,6 +203,7 @@ class CrAnData(xr.Dataset):
     #TODO Implement open_s3_zarr if I want this later
 
     def unify_convert_chunks(self,out_path):
+        '''Run xarray.DataSet.unify_chunks() and apply new chunks to each var'''
         new_self = self.unify_chunks()
         for k in new_self.keys():
             new_self[k] = new_self[k].chunk({k:new_self.chunks[k] for k in new_self[k].dims})
