@@ -46,35 +46,43 @@ class TensorConverter:
 
 class DNATransformApplicator:
     """
-    A wrapper node that applies state-specific postprocessing to batches
-    produced by an upstream node. The upstream node is expected to be a torchdata.nodes.BaseNode 
-    (or wrapped via IterableWrapper) that yields raw batches. CrAnDataNode applies the processing
-    (e.g. reverse complementing and shuffling) based on the given state instructions.
+    Applies state‐specific postprocessing (reverse‐complement + shuffling) to xarray.Dataset batches.
     """
-    def __init__(self, state="train", instructions=None, dnatransform=None, shuffle_dims=None):
+    def __init__(self, state="train", instructions=None, dnatransform=None, shuffle_dims=None,sequence_vars=None):
         self.state = state
         self.instructions = instructions or {}
         self.dnatransform = dnatransform
         self.shuffle_dims = shuffle_dims or []
+        self.sequence_vars = sequence_vars or ["sequences"]
 
-    def __call__(self,batch):
-        # Apply reverse complement processing if needed.
-        if self.instructions.get("apply_rc") and self.dnatransform is not None and 'sequences' in batch.data_vars:
-            start, end, rc_flags = self.dnatransform.get_window_indices_and_rc(batch['sequences'])
-            batch = batch.isel(seq_len=slice(start, end))
-            batch = self.dnatransform.apply_rc(batch, rc_flags)
+    def __call__(self, batch: xr.Dataset) -> xr.Dataset:
+        # 1) Reverse‐complement windowing
+        if self.instructions.get("apply_rc") and self.dnatransform is not None:
+            # find first available sequence var to compute window+flags
+            for key in self.sequence_vars:
+                if key in batch.data_vars:
+                    start, end, rc_flags = self.dnatransform.get_window_indices_and_rc(batch[key])
+                    # slice all
+                    batch = batch.isel(seq_len=slice(start, end))
+                    # apply RC individually to each seq‐var present
+                    for k in self.sequence_vars:
+                        if k in batch.data_vars:
+                            batch[k] = self.dnatransform.apply_rc(batch[k], rc_flags)
+                    break
 
-        # Apply shuffling if needed.
+        # 2) Shuffle entire dataset along each shuffle_dim in one shot
         if self.instructions.get("shuffle") and self.shuffle_dims:
+            indexers = {}
             for dim in self.shuffle_dims:
-                example = next((da for da in batch.data_vars.values() if dim in da.dims), None)
-                if example is not None:
-                    axis = example.get_axis_num(dim)
-                    perm = np.random.permutation(example.shape[axis])
-                    for var_name, da in batch.data_vars.items():
-                        if dim in da.dims:
-                            batch.data_vars[var_name] = da.isel({dim: perm})
+                if dim in batch.dims:
+                    size = batch.sizes[dim]
+                    indexers[dim] = np.random.permutation(size)
+            if indexers:
+                # xarray will apply each indexer to all arrays that share that dim
+                batch = batch.isel(indexers)
+
         return batch
+
 
 class SequentialNode(BaseNode):
     """
@@ -106,54 +114,74 @@ class SequentialNode(BaseNode):
         raise StopIteration
 
 class CrAnDataModule:
-    """
-    A module wrapping a CrAnData object (e.g. an xarray.Dataset with genomic data)
-    that uses xbatcher for sampling. A DNATransform (if provided) is applied to the
-    "sequences" key when batches are retrieved. Dataloaders are provided via torchdata.nodes.
-    
-    Attributes:
-      adata: The CrAnData object.
-      batch_size: Number of slices to sample along the "var" dimension.
-      shuffle_dims: List of dimension names to be shuffled uniformly in each batch.
-      dnatransform: Optional callable applied to the "sequences" variable.
-    """
-    def __init__(self, adata, batch_size=32, load_keys={'sequences':'sequences'}, shuffle=False, dnatransform=None, shuffle_dims=None,cache_dir = './batch_cache',split='var-_-split',batch_dim='var'):
+    def __init__(
+        self,
+        adata,
+        batch_size: int = 32,
+        load_keys: dict[str,str] = {'sequences':'sequences'},
+        shuffle: bool = False,
+        dnatransform=None,
+        shuffle_dims: list[str] | None = None,
+        split: str = 'var-_-split',
+        batch_dim: str = 'var',
+        sequence_vars: list[str] = ['sequences'],
+        prefetch_factor: int = 2,
+        pin_memory: bool | None = None,
+    ):
         self.adata = adata
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.dnatransform = dnatransform
-        self.shuffle_dims = shuffle_dims or []  # e.g. ['obs']
+        self.shuffle_dims = shuffle_dims or []
         self.load_keys = load_keys
-        self._generators = {}  # Holds xbatcher generators for each state
         self.split = split
         self.batch_dim = batch_dim
-        # self.cache_dir = str(cache_dir)
+        self.sequence_vars = sequence_vars
+        self.prefetch_factor = prefetch_factor
+        self.pin_memory = pin_memory
+
         self.instructions = {
-            "train": {"apply_rc": True, "shuffle": shuffle},
-            "val": {"apply_rc": True, "shuffle": shuffle},
-            "test": {"apply_rc": False, "shuffle": False},
-            "predict": {"apply_rc": False, "shuffle": False},
+            "train":  {"apply_rc": True,  "shuffle": shuffle},
+            "val":    {"apply_rc": True,  "shuffle": shuffle},
+            "test":   {"apply_rc": False, "shuffle": False},
+            "predict":{"apply_rc": False, "shuffle": False},
         }
 
+        self._generators: dict[str, xbatcher.BatchGenerator] = {}
+
     def setup(self, state="train"):
-        """
-        Set up the xbatcher generator for a given state.
-        (It is assumed that the CrAnData object already has appropriate sample probabilities.)
-        """
-        # self.adata = CrAnData.open_zarr(self.adata.repo)#Do this outside
-        state_idx = self.adata[self.split].compute()==state
-        loading_adata = self.adata.isel({self.batch_dim:state_idx}) if state != 'predict' else self.adata
-        cur_keys = list(self.load_keys.keys())
-        loading_adata = loading_adata[cur_keys]
-        dim_dict = dict(loading_adata.sizes) #for futurewarning
-        dim_dict[self.batch_dim] = self.batch_size
-        # os.makedirs(self.cache_dir,exist_ok=True)
+        # same as before…
+        state_idx = self.adata[self.split].compute() == state
+        ds = self.adata.isel({self.batch_dim: state_idx}) if state != 'predict' else self.adata
+        ds = ds[list(self.load_keys.keys())]
+        dims = dict(ds.sizes)
+        dims[self.batch_dim] = self.batch_size
+
         self._generators[state] = xbatcher.BatchGenerator(
-            ds=loading_adata,
-            input_dims=dim_dict,
+            ds=ds,
+            input_dims=dims,
             batch_dims={self.batch_dim: self.batch_size},
-            cache=None #For now, idk might be useful later
+            cache=None,
         )
+
+    def _get_dataloader(self, state: str) -> Loader:
+        source = IterableWrapper(self._generators[state])
+
+        transform = DNATransformApplicator(
+            state=state,
+            instructions=self.instructions,
+            dnatransform=self.dnatransform,
+            shuffle_dims=self.shuffle_dims,
+            sequence_vars=self.sequence_vars,
+        )
+        converter = TensorConverter(self.load_keys)
+        node = Mapper(node, map_fn=lambda x: converter(transform(x)))
+
+        node = Prefetcher(node, prefetch_factor=self.prefetch_factor)
+        if self.pin_memory:
+            node = PinMemory(node, self.pin_memory)
+
+        return Loader(node)
 
     @property
     def train_dataloader(self):
@@ -172,21 +200,13 @@ class CrAnDataModule:
         return self._get_dataloader("predict")
 
     def load(self):
-        """load module's dataset to memory"""
         self.adata.load()
-        
-    def _get_dataloader(self, state: str):
-        node = CrAnDataNode(self._generators[state], state=state,
-                                 instructions=self.instructions, dnatransform=self.dnatransform, 
-                                 shuffle_dims=self.shuffle_dims)
-        converter = TensorConverter(self.load_keys)
-        node = Mapper(node,map_fn=converter)
-        # node = Prefetcher(node, prefetch_factor=4)
-        return Loader(node)
 
     def __repr__(self):
-        return (f"CrAnDataModule(batch_size={self.batch_size}, "
-                f"shuffle_dims={self.shuffle_dims}, dnatransform={self.dnatransform})")
+        return (
+            f"CrAnDataModule(batch_size={self.batch_size}, "
+            f"shuffle_dims={self.shuffle_dims}, dnatransform={self.dnatransform})"
+        )
 
 
 class MetaCrAnDataModule:
@@ -201,9 +221,11 @@ class MetaCrAnDataModule:
         shuffle_dims=None,
         epoch_size=100000,
         batch_dim='var',
+        sequence_vars=['sequences'],
         join='inner',
         num_workers=0,
         pin_memory=None,
+        prefetch_factor=2
     ):
         self.batch_dim = batch_dim
         self.batch_size = batch_size
@@ -214,7 +236,8 @@ class MetaCrAnDataModule:
         self.epoch_size = epoch_size
         self.num_workers = num_workers
         self.pin_memory = pin_memory
-
+        self.sequence_vars = sequence_vars
+        self.prefetch_factor=prefetch_factor
         # Wrap each CrAnData in its own CrAnDataModule
         self.modules = [
             CrAnDataModule(
@@ -223,7 +246,8 @@ class MetaCrAnDataModule:
                 shuffle=shuffle,
                 dnatransform=dnatransform,
                 shuffle_dims=shuffle_dims,
-                load_keys=load_keys
+                load_keys=load_keys,
+                sequence_vars=sequence_vars
             )
             for i, adata in enumerate(adatas)
         ]
@@ -240,20 +264,28 @@ class MetaCrAnDataModule:
 
         # --- 2. Compute unioned coordinates across all adatas ---
         # gather all dimension names
-        if join == 'inner':
-            all_dims = set().intersection(*(set(ds.coords) for ds in adatas))
-        else:
-            all_dims = set().union(*(set(ds.coords) for ds in adatas))
+        if join not in ('inner', 'outer'):
+            raise ValueError("`join` must be either 'inner' or 'outer'")
+
+        # collect all dims present in any dataset
+        all_dims = set().union(*(set(ds.coords) for ds in adatas))
         self.global_coords = {}
+
         for dim in all_dims:
-            if dim != batch_dim:
-                # collect only those adatas that actually have this dim
-                arrays = [ds.coords[dim].values for ds in adatas if dim in ds.coords]
-                # take unique union
-                union_vals = np.unique(np.concatenate(arrays))
-                self.global_coords[dim] = union_vals
-            else:
-                print(batch_dim)
+            if dim == batch_dim:
+                continue
+
+            # gather each dataset's coordinate array for this dim (if present)
+            coord_lists = [ds.coords[dim].values for ds in adatas if dim in ds.coords]
+            if not coord_lists:
+                continue  # nothing to do
+            if join == 'outer':
+                # union of all coordinate values
+                vals = set().union(*(set(vals) for vals in coord_lists))
+            else:  # join == 'inner'
+                iter_sets = [set(vals) for vals in coord_lists]
+                vals = iter_sets[0].intersection(*iter_sets[1:])
+            self.global_coords[dim] = np.array(sorted(vals))
     
         # State‐specific reverse‐complement / shuffle instructions:
         self.instructions = {
@@ -278,23 +310,21 @@ class MetaCrAnDataModule:
             for i, mod in enumerate(self.modules)
         }
         sampler = MultiNodeWeightedSampler(node_map, self.weight_map)
-
+        
         reindex_fn = lambda ds: ds.reindex(self.global_coords, fill_value=np.nan)
-        node = Mapper(sampler, map_fn=reindex_fn)
-
         transform_applicator = DNATransformApplicator(
             state=state,
             instructions=self.instructions,
             dnatransform=self.dnatransform,
-            shuffle_dims=self.shuffle_dims
+            shuffle_dims=self.shuffle_dims,
+            sequence_vars=self.sequence_vars
         )
-        node = Mapper(node, map_fn=transform_applicator)
-
         converter = TensorConverter(self.load_keys)
-        node = Mapper(node, map_fn=converter)
-        # node = Prefetcher(node,prefetch_factor=4)
+        node = Mapper(sampler, 
+                      map_fn=lambda x: converter(transform_applicator(reindex_fn(x))))
+        node = Prefetcher(node,prefetch_factor=self.prefetch_factor)
         if self.pin_memory is not None:
-            PinMemory(node,self.pin_memory)
+            node = PinMemory(node,self.pin_memory)
         return Loader(node)
 
     @property
@@ -323,7 +353,8 @@ class MetaCrAnDataModule:
             state=state,
             instructions=self.instructions,
             dnatransform=self.dnatransform,
-            shuffle_dims=self.shuffle_dims
+            shuffle_dims=self.shuffle_dims,
+            sequence_vars=self.sequence_vars
         )
         node = Mapper(multi_node, map_fn=transform_applicator)
         converter = TensorConverter(self.load_keys)
