@@ -2,556 +2,430 @@
 
 from __future__ import annotations
 import os
-import re
 import tempfile
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import pybigtools
-from loguru import logger
 from tqdm import tqdm
-from collections import defaultdict
 import xarray as xr
-import sparse
-import json
-import h5py  # for HDF5 backing
-from . import crandata
-from .crandata import CrAnData
 import zarr
 
-# -----------------------
-# Utility functions
-# -----------------------
+from .crandata import CrAnData
+from collections import defaultdict
+try:
+    import sparse
+except:
+    print('no sparse')
 
-def _sort_files(filename: Path):
-    filename = Path(filename)
-    parts = filename.stem.split("_")
-    if len(parts) > 1:
+# ——————————————————————————————————————————————————————————
+# low-level utilities
+# ——————————————————————————————————————————————————————————
+
+def _make_temp_bed(peaks: pd.DataFrame, width: int) -> str:
+    # assume peaks has 'chrom','start','end'
+    tmp = tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".bed")
+    half = (width - (peaks.end - peaks.start)) // 2
+    starts = (peaks.start - half).clip(lower=0)
+    ends   = starts + width
+    for c,s,e in zip(peaks.chrom, starts, ends):
+        tmp.write(f"{c}\t{int(s)}\t{int(e)}\n")
+    tmp.close()
+    return tmp.name
+
+def _extract_bw(
+    bw_path: Path,
+    bed_path: str,
+    bin_stat: str,
+    n_bins: int,
+    fill: float = 0.0,
+) -> np.ndarray:    
+    with pybigtools.open(str(bw_path), "r") as bw:
+        lines = open(bed_path).read().splitlines()
+        n = len(lines)
+        arr = np.full((n, n_bins), fill, dtype="float32")
+        for i, (c, s, e) in enumerate((l.split("\t") for l in lines)):
+            try:
+                vals = bw.values(c, int(s), int(e), missing=fill,
+                                 exact=False, bins=n_bins, summary=bin_stat)
+                arr[i] = vals
+            except KeyError:
+                pass
+        return arr.astype("float32")
+
+# ——————————————————————————————————————————————————————————
+# public API #1: create brand-new CrAnData from a peaks-DF
+# ——————————————————————————————————————————————————————————
+
+def crandata_from_bigwigs(
+    region_table: pd.DataFrame,
+    bigwig_dir: Path|str,
+    backed_path: Path|str,
+    *,
+    array_name: str = 'X',
+    obs_dim: str = 'obs',
+    var_dim: str = 'var',
+    seq_dim: str = 'seq_bins',
+    target_region_width: int,
+    bin_stat: str = "mean",
+    chunk_size: int = 512,
+    n_bins: int = 1,
+    backend: str = "zarr",
+    tile_size: int = 5000,
+) -> CrAnData:
+    """
+    Create a new CrAnData from region_table and a folder of BigWigs.
+    The resulting store is written to `backed_path`, and a first array
+    named `array_name` is streamed in along dims (obs_dim, var_dim, seq_dim).
+    """
+    bigwig_dir = Path(bigwig_dir)
+
+    # 1) scan BigWigs and collect chromosomes
+    bw_files = []
+    chroms = set()
+    for p in bigwig_dir.iterdir():
         try:
-            return (False, int(parts[1]))
-        except ValueError:
-            return (True, filename.stem)
-    return (True, filename.stem)
+            with pybigtools.open(str(p), "r") as bw:
+                chroms |= set(bw.chroms().keys())
+            bw_files.append(p)
+        except Exception:
+            continue
+    if not bw_files:
+        raise FileNotFoundError(f"No BigWigs in {bigwig_dir!r}")
+    bw_files.sort()
 
-def _custom_region_sort(region: str) -> tuple[int, int, int]:
-    chrom, pos = region.split(":")
-    start, _ = map(int, pos.split("-"))
-    numeric_match = re.match(r"chr(\d+)|chrom(\d+)", chrom, re.IGNORECASE)
-    if numeric_match:
-        chrom_num = int(numeric_match.group(1) or numeric_match.group(2))
-        return (0, chrom_num, start)
-    else:
-        return (1, chrom, start)
-
-def _read_chromsizes(chromsizes_file: Path) -> dict[str, int]:
-    chromsizes = pd.read_csv(chromsizes_file, sep="\t", header=None, names=["chrom", "size"])
-    return chromsizes.set_index("chrom")["size"].to_dict()
-
-def _check_bed_file_format(bed_file: Path) -> None:
-    with open(bed_file) as f:
-        first_line = f.readline().strip()
-    if len(first_line.split("\t")) < 3:
-        raise ValueError(f"BED file '{bed_file}' is not in the correct format. Expected at least three tab-separated columns.")
-    pattern = r".*\t\d+\t\d+.*"
-    if not re.match(pattern, first_line):
-        raise ValueError(f"BED file '{bed_file}' is not in the correct format. Expected columns 2 and 3 to contain integers.")
-
-def _filter_and_adjust_chromosome_data(peaks: pd.DataFrame, chrom_sizes: dict,
-                                      max_shift: int = 0, chrom_col: str = "chrom",
-                                      start_col: str = "start", end_col: str = "end",
-                                      MIN_POS: int = 0) -> pd.DataFrame:
-    peaks["_chr_size"] = peaks[chrom_col].map(chrom_sizes)
-    peaks = peaks.dropna(subset=["_chr_size"]).copy()
-    peaks["_chr_size"] = peaks["_chr_size"].astype(int)
-    starts = peaks[start_col].to_numpy(dtype=int)
-    ends = peaks[end_col].to_numpy(dtype=int)
-    chr_sizes_arr = peaks["_chr_size"].to_numpy(dtype=int)
-    orig_length = ends - starts
-    desired_length = orig_length + 2 * max_shift
-    new_starts = starts - max_shift
-    new_ends = new_starts + desired_length
-    cond_left_edge = new_starts < MIN_POS
-    shift_needed = MIN_POS - new_starts[cond_left_edge]
-    new_starts[cond_left_edge] = MIN_POS
-    new_ends[cond_left_edge] += shift_needed
-    cond_right_edge = new_ends > chr_sizes_arr
-    shift_needed = new_ends[cond_right_edge] - chr_sizes_arr[cond_right_edge]
-    new_ends[cond_right_edge] = chr_sizes_arr[cond_right_edge]
-    new_starts[cond_right_edge] -= shift_needed
-    cond_left_clamp = new_starts < MIN_POS
-    new_starts[cond_left_clamp] = MIN_POS
-    peaks[start_col] = new_starts
-    peaks[end_col] = new_ends
-    peaks.drop(columns=["_chr_size"], inplace=True)
-    return peaks
-
-def _read_consensus_regions(regions_file: Path, chromsizes_dict: dict | None = None) -> pd.DataFrame:
-    if chromsizes_dict is None:
-        logger.warning("Chromsizes file not provided. Will not check if regions are within chromosomes", stacklevel=1)
-    consensus_peaks = pd.read_csv(
-        regions_file,
-        sep="\t",
-        header=None,
-        usecols=[0, 1, 2],
-        dtype={0: str, 1: "Int32", 2: "Int32"},
+    # 2) filter peaks to those chroms
+    peaks = region_table.query("chrom in @chroms").reset_index(drop=True)
+    peaks["region"] = (
+        peaks.chrom.astype(str)
+        + ":"
+        + peaks.start.astype(int).astype(str)
+        + "-"
+        + peaks.end.astype(int).astype(str)
     )
-    consensus_peaks.columns = ["chrom", "start", "end"]
-    consensus_peaks["region"] = consensus_peaks["chrom"].astype(str) + ":" + \
-                                consensus_peaks["start"].astype(str) + "-" + \
-                                consensus_peaks["end"].astype(str)
-    if chromsizes_dict:
-        pass
-    else:
-        return consensus_peaks
-    valid_mask = consensus_peaks.apply(
-        lambda row: row["chrom"] in chromsizes_dict and row["start"] >= 0 and row["end"] <= chromsizes_dict[row["chrom"]],
-        axis=1,
-    )
-    consensus_peaks_filtered = consensus_peaks[valid_mask]
-    if len(consensus_peaks) != len(consensus_peaks_filtered):
-        logger.warning(f"Filtered {len(consensus_peaks) - len(consensus_peaks_filtered)} consensus regions (not within chromosomes)")
-    return consensus_peaks_filtered
 
-def _create_temp_bed_file(consensus_peaks: pd.DataFrame, target_region_width: int, adjust=True) -> str:
-    adjusted_peaks = consensus_peaks.copy()
-    if adjust:
-        adjusted_peaks[1] = adjusted_peaks.apply(
-            lambda row: max(0, row.iloc[1] - (target_region_width - (row.iloc[2] - row.iloc[1])) // 2),
-            axis=1,
+    # 3) build obs- and var- coordinate arrays
+    obs_idx = [p.stem.replace(".", "_") for p in bw_files]
+    var_idx = peaks.region.values
+
+    extra = {}
+    # *** note: we use the SAME pattern “<dim>-_-index” for both obs & var ***
+    extra[f"{obs_dim}-_-index"] = xr.DataArray(obs_idx, dims=[obs_dim])
+    extra[f"{var_dim}-_-index"] = xr.DataArray(var_idx, dims=[var_dim])
+
+    # var‐metadata too
+    for col in ("chrom","start","end","region"):
+        extra[f"{var_dim}-_-{col}"] = (
+            xr.DataArray(peaks[col].values, dims=[var_dim])
+              .chunk({var_dim: chunk_size})
         )
-        adjusted_peaks[2] = adjusted_peaks[1] + target_region_width
-        adjusted_peaks[1] = adjusted_peaks[1].astype(np.int64)
-        adjusted_peaks[2] = adjusted_peaks[2].astype(np.int64)
-    temp_bed_file = "temp_adjusted_regions.bed"
-    adjusted_peaks.to_csv(temp_bed_file, sep="\t", header=False, index=False)
-    return temp_bed_file
 
-def _extract_values_from_bigwig(bw_file: Path, bed_file: Path, target: str,n_bins: int = None,fill_val=0.) -> np.ndarray:
-    bw_file = str(bw_file)
-    bed_file = str(bed_file)
-    with pybigtools.open(bw_file, "r") as bw:
-        chromosomes_in_bigwig = set(bw.chroms())
-    temp_bed_file = tempfile.NamedTemporaryFile(delete=False)
-    bed_entries_to_keep_idx = []
-    num_lines = 0
-    with open(bed_file) as fh:
-        for idx, line in enumerate(fh):
-            chrom = line.split("\t", 1)[0]
-            num_lines +=1
-            if True:#chrom in chromosomes_in_bigwig:
-                temp_bed_file.write(line.encode("utf-8"))
-                bed_entries_to_keep_idx.append(idx)
-    temp_bed_file.close()
-    total_bed_entries = len(bed_entries_to_keep_idx)
-    bed_entries_to_keep_idx = np.array(bed_entries_to_keep_idx, np.intp)
-    n_columns = n_bins if n_bins is not None else 1
-    
-    if target == "mean":
-        with pybigtools.open(bw_file, "r") as bw:
-            values = np.fromiter(
-                bw.average_over_bed(bed=temp_bed_file.name, names=None, stats="mean0"),
-                dtype=np.float32,
-            )
-    elif target == "max":
-        with pybigtools.open(bw_file, "r") as bw:
-            values = np.fromiter(
-                bw.average_over_bed(bed=temp_bed_file.name, names=None, stats="max"),
-                dtype=np.float32,
-            )
-    elif target == "count":
-        with pybigtools.open(bw_file, "r") as bw:
-            values = np.fromiter(
-                bw.average_over_bed(bed=temp_bed_file.name, names=None, stats="sum"),
-                dtype=np.float32,
-            )
-    elif target == "logcount":
-        with pybigtools.open(bw_file, "r") as bw:
-            values = np.log1p(
-                np.fromiter(
-                    bw.average_over_bed(bed=temp_bed_file.name, names=None, stats="sum"),
-                    dtype=np.float32,
-                )
-            )
-    elif target == "raw":
-        with pybigtools.open(bw_file, "r") as bw:
-            lines = open(temp_bed_file.name).readlines()
-            values = np.full((num_lines, n_columns), fill_val, dtype=np.float32)
-            for i,(chrom, start, end) in enumerate([line.split("\t")[:3] for line in lines]):
-                try:
-                    values[i,:] = np.array(
-                        bw.values(chrom, int(start), int(end), missing=fill_val, exact=False, bins=n_bins, summary='mean')
-                    )
-                except KeyError as e:
-                    # print(e)
-                    values[i,:] = fill_val
+    adata = CrAnData(**extra)
+    adata.attrs['chunk_size'] = chunk_size
+
+    # 4) initialize the on‐disk store
+    if backend == "icechunk":
+        adata.to_icechunk(str(backed_path), mode="w")
     else:
-        raise ValueError(f"Unsupported target '{target}'")
-    os.remove(temp_bed_file.name)
-    if target == "raw":
-        all_data = np.full((num_lines, values.shape[1]), np.nan, dtype=np.float32)
-        all_data[bed_entries_to_keep_idx, :] = values[bed_entries_to_keep_idx, :]
-        return all_data
-    else:
-        if values.shape[0] != total_bed_entries:
-            all_values = np.full(num_lines, np.nan, dtype=np.float32)
-            all_values[bed_entries_to_keep_idx] = values
-            return all_values
-        else:
-            return values
+        adata.to_zarr(str(backed_path), mode="w")
+        adata = CrAnData.open_zarr(str(backed_path))
 
-def _add_x_to_ds(adata, bw_files, consensus_peaks, target, target_region_width,
-                 obs_index, var_index, tile_size=20000, chunk_size=2048, n_bins=None,
-                 backend="zarr"):
-    """
-    Write training data extracted from bigWig files to a store, using distinct parameters
-    for the in-memory tile size and on-disk chunk size. The final xarray DataArray 'X' has
-    shape (n_obs, n_var, seq_len).
+    # 5) stream in the very first array
+    return add_bigwig_array(
+        adata,
+        region_table=peaks,
+        bigwig_dir=bw_files,
+        array_name=array_name,
+        obs_dim=obs_dim,
+        var_dim=var_dim,
+        seq_dim=seq_dim,
+        bin_stat=bin_stat,
+        target_region_width=target_region_width,
+        chunk_size=chunk_size,
+        n_bins=n_bins,
+        backend=backend,
+        tile_size=tile_size,
+    )
 
-    Parameters:
-      adata              : Anndata object in which the 'X' data will be stored.
-      bw_files           : List of bigWig file paths (one per observation).
-      consensus_peaks    : Array-like of consensus peak definitions, shape (n_var, ...).
-      target             : Region specification passed to the extractor.
-      target_region_width: Width parameter defining the target region.
-      obs_index          : Array-like of observation identifiers.
-      var_index          : Array-like of consensus peak identifiers.
-      tile_size          : Number of consensus peaks per in-memory tile (for processing).
-      chunk_size         : On-disk chunk size along the 'var' axis for xarray/Dask and Zarr.
-      n_bins             : Optional parameter specifying the number of bins for bigWig extraction.
-      backend            : Either "zarr" or "icechunk". Determines which backend is used.
-    """
+# ——————————————————————————————————————————————————————————
+# public API #2: append a new array from bigwigs into an existing CrAnData
+# ——————————————————————————————————————————————————————————
+
+def add_bigwig_array(
+    adata: CrAnData,
+    region_table: pd.DataFrame,
+    bigwig_dir: Path|str|list[Path],
+    *,
+    array_name: str,
+    obs_dim: str,
+    var_dim: str,
+    seq_dim: str,
+    target_region_width: int,
+    bin_stat: str = "mean",
+    chunk_size: int = 512,
+    n_bins: int = 1,
+    backend: str = "zarr",
+    tile_size: int = 5000,
+    fill_value = np.nan,
+) -> CrAnData:
+    # allow passing either a folder or pre-collected list
+    if not isinstance(bigwig_dir, (list,tuple)):
+        bigwig_dir = list(Path(bigwig_dir).iterdir())
+    bw_files = sorted(Path(p) for p in bigwig_dir)
+
     n_obs = len(bw_files)
-    n_var = consensus_peaks.shape[0]
+    n_var = len(region_table)
 
-    # Determine sequence length using the first bigWig file over all consensus peaks.
-    temp_bed = _create_temp_bed_file(consensus_peaks, target_region_width)
-    sample = _extract_values_from_bigwig(bw_files[0], temp_bed, target=target, n_bins=n_bins)
-    os.remove(temp_bed)
+    # 1) determine seq_len from first file
+    tmp0 = _make_temp_bed(region_table, target_region_width)
+    sample = _extract_bw(bw_files[0], tmp0, bin_stat, n_bins,fill=fill_value)
+    os.remove(tmp0)
     if sample.ndim == 1:
         sample = sample.reshape(n_var, 1)
     seq_len = sample.shape[1]
-
-    # Ensure tile_size does not exceed the number of consensus peaks.
-    tile_size = min(tile_size, n_var)
-
-    # Create an xarray DataArray with on-disk chunking along the 'var' axis.
-    adata['X'] = xr.DataArray(
-        np.empty((n_obs, n_var, seq_len)),
-        dims=["obs", "var", "seq_bins"],
+    
+    # 2) create empty DataArray and Zarr/Icechunk backing
+    da = xr.DataArray(
+        np.full((n_obs, n_var, seq_len), np.nan, dtype="float32"),
+        dims=[obs_dim, var_dim, seq_dim],
         coords={
-            "obs": np.array(obs_index),
-            "var": np.array(var_index),
-            "seq_bins": np.arange(seq_len)
+            obs_dim: adata[f"{obs_dim}-_-index"].values,
+            var_dim: adata[f"{var_dim}-_-index"].values,
+            seq_dim: np.arange(seq_len),
         }
-    ).chunk({'obs': n_obs, 'var': chunk_size, 'seq_bins': seq_len})
+    ).chunk({obs_dim: n_obs, var_dim: chunk_size, seq_dim: seq_len})
 
-    if backend == "zarr":
-        # Use the zarr store defined in adata.encoding.
-        store_path = adata.encoding['source']
-        adata.to_zarr(store_path, mode='a')
-        store = zarr.open(store_path, mode='a')
+    adata[array_name] = da
 
-        # Create the 'X' dataset if it doesn't exist.
-        if 'X' not in store:
-            store.create_dataset(
-                'X', shape=(n_obs, n_var, seq_len),
-                chunks=(n_obs, chunk_size, seq_len),
-                dtype='float32',
-                fill_value=np.nan
-            )
-        array = store['X']
-
-    elif backend == "icechunk":
-        # Use the icechunk-backed store from the session.
+    # open the store
+    if backend=="icechunk":
         adata.session = adata.repo.writable_session("main")
-        store = adata.session.store
-        group = zarr.open_group(store, mode='a')
-        if 'X' not in group:
-            array = group.create(
-                name='X',
+        grp = zarr.open_group(adata.session.store, mode="a")
+        arr = grp.create(
+            name=array_name,
+            shape=(n_obs, n_var, seq_len),
+            chunks=(n_obs, chunk_size, seq_len),
+            dtype="float32",
+            fill_value=fill_value
+        )
+        arr.attrs["_ARRAY_DIMENSIONS"] = [obs_dim, var_dim, seq_dim]
+    else:
+        path = adata.encoding["source"]
+        adata.to_zarr(path, mode="a")
+        store = zarr.open(path, mode="a")
+        if array_name not in store:
+            arr = store.create_dataset(
+                array_name,
                 shape=(n_obs, n_var, seq_len),
                 chunks=(n_obs, chunk_size, seq_len),
-                dtype='float32',
-                fill_value=np.nan
+                dtype="float32",
+                fill_value=fill_value
             )
-            # Set dimension metadata so that icechunk/xarray matches chunk sizes.
-            array.attrs["_ARRAY_DIMENSIONS"] = ["obs", "var", "seq_bins"]
         else:
-            array = group['X']
-    else:
-        raise ValueError("Unsupported backend. Use 'zarr' or 'icechunk'.")
+            arr = store[array_name]
 
-    # Loop over the consensus peaks in in-memory tiles.
-    for var_start in tqdm(range(0, n_var, tile_size), desc="Processing memory tiles"):
-        var_end = min(var_start + tile_size, n_var)
-        # Create a temporary BED file for the current tile of consensus peaks.
-        temp_bed = _create_temp_bed_file(consensus_peaks[var_start:var_end], target_region_width)
+    # 3) tile through var-dimension
+    for v0 in tqdm(range(0, n_var, tile_size), desc=f"writing {array_name}"):
+        v1 = min(v0 + tile_size, n_var)
+        tile = region_table.iloc[v0:v1]
+        tmpb = _make_temp_bed(tile, target_region_width)
 
-        # For each bigWig file, extract data for the current tile and write it.
-        results = []
-        for obs_idx, bw_file in enumerate(bw_files):
-            result = _extract_values_from_bigwig(bw_file, temp_bed, target=target, n_bins=n_bins)
-            if result.ndim == 1:
-                result = result.reshape((var_end - var_start, seq_len))
-            results.append(result)
-        array[:, var_start:var_end, :] = np.stack(results,axis=0).astype('float32')
-        os.remove(temp_bed)
+        block = []
+        for bw in bw_files:
+            out = _extract_bw(bw, tmpb, bin_stat, n_bins, fill=fill_value)
+            if out.ndim == 1:
+                out = out.reshape((v1 - v0, seq_len))
+            block.append(out)
+        block = np.stack(block, axis=0).astype("float32")
 
-        # If using icechunk, commit the current tile.
-        # if backend == "icechunk":
-        #     adata.to_icechunk(commit_name=f'append_tile_{var_start}_{var_end}', mode='a')
+        arr[:, v0:v1, :] = block
+        os.remove(tmpb)
 
-    if backend == "icechunk":
-        # Switch to a readonly session after writing is complete.
-        adata.session = adata.repo.readonly_session("main")
-
-def import_bigwigs(bigwigs_folder: Path, regions_file: Path,
-                   backed_path: Path, target_region_width: int | None,
-                   target: str = 'raw',  # e.g. "raw", "mean", "max", etc.
-                   chromsizes_file: Path | None = None, genome: any = None,
-                   max_stochastic_shift: int = 0, chunk_size: int = 512, n_bins: int = None,
-                   backend='zarr',tile_size=5000) -> 'CrAnData':
-    """
-    Import bigWig files and consensus regions to create a backed CrAnData object.
-    This function validates inputs, filters and adjusts consensus regions (using _filter_and_adjust_chromosome_data),
-    collects valid bigWig files, extracts signal values into an HDF5 file, and returns a CrAnData object.
-    """
-    bigwigs_folder = Path(bigwigs_folder)
-    regions_file = Path(regions_file)
-    if not bigwigs_folder.is_dir():
-        raise FileNotFoundError(f"Directory '{bigwigs_folder}' not found")
-    if not regions_file.is_file():
-        raise FileNotFoundError(f"File '{regions_file}' not found")
-
-    # Read chromosome sizes.
-    chromsizes_dict = None
-    if chromsizes_file is not None:
-        chromsizes_dict = _read_chromsizes(chromsizes_file)
-    if genome is not None:
-        chromsizes_dict = genome.chrom_sizes
-
-    _check_bed_file_format(regions_file)
-    consensus_peaks = _read_consensus_regions(regions_file, chromsizes_dict)
-    region_width = int(np.round(np.mean(consensus_peaks['end'] - consensus_peaks['start'])))
-    consensus_peaks = consensus_peaks.loc[(consensus_peaks['end'] - consensus_peaks['start']) == region_width, :]
-    consensus_peaks = _filter_and_adjust_chromosome_data(consensus_peaks, chromsizes_dict, max_shift=max_stochastic_shift)
-    shifted_width = target_region_width + 2 * max_stochastic_shift
-    consensus_peaks = consensus_peaks.loc[(consensus_peaks['end'] - consensus_peaks['start']) == shifted_width, :]
-
-    # Collect valid bigWig files.
-    bw_files = []
-    chrom_set = set([])  # Start with no chromosomes
-    for file in tqdm(os.listdir(bigwigs_folder)):
-        file_path = os.path.join(bigwigs_folder, file)
-        try:
-            bw = pybigtools.open(file_path, "r")
-            file_chroms = set(bw.chroms().keys())
-            chrom_set |= file_chroms
-            bw_files.append(file_path)
-            bw.close()
-        except (ValueError, pybigtools.BBIReadError):
+        if backend=="icechunk":
+            # commit each tile (optional)
+            # adata.to_icechunk(mode="a", commit_name=f"{array_name}_{v0}_{v1}")
             pass
-    # If no valid chromosomes were found, default to an empty set.
-    chrom_set = set(chrom_set)
-    # Filter consensus regions (var) to include only regions on chromosomes present in all bigWig files.
-    consensus_peaks = consensus_peaks.loc[consensus_peaks["chrom"].isin(chrom_set), :]
 
-    bw_files = sorted(bw_files)
-    if not bw_files:
-        raise FileNotFoundError(f"No valid bigWig files found in '{bigwigs_folder}'")
-
-    logger.info(f"Extracting values from {len(bw_files)} bigWig files...")
-    # Build obs and var DataFrames.
-    obs_df = pd.DataFrame(
-        {"file_path": bw_files},
-        index=[os.path.basename(file).rpartition(".")[0].replace(".", "_") for file in bw_files]
-    )
-    var_df = consensus_peaks.set_index("region")
-    var_df["chunk_index"] = np.arange(var_df.shape[0]) // chunk_size
-    var_df["start"] = var_df["start"].astype('int64')
-    var_df["end"] = var_df["end"].astype('int64')
-    var_df["chunk_index"] = var_df["chunk_index"].astype('int64')
-    extra_vars = {}
-    for col in obs_df.columns:
-        extra_vars[f"obs-_-{col}"] = xr.DataArray(obs_df[col].values, dims=["obs"])
-    extra_vars["obs-_-index"] = xr.DataArray(obs_df.index.values, dims=["obs"])
-    for col in var_df.columns:
-        extra_vars[f"var-_-{col}"] = xr.DataArray(var_df[col].values, dims=["var"]).chunk({'var':chunk_size})
-    extra_vars["var-_-index"] = xr.DataArray(var_df.index.values, dims=["var"]).chunk({'var':chunk_size})
-
-    adata = CrAnData(**extra_vars)
-    if backend == 'icechunk':
-        adata.to_icechunk(str(backed_path),mode='w')
+    if backend=="icechunk":
+        adata.session = adata.repo.readonly_session("main")
     else:
-        adata.to_zarr(str(backed_path),mode='w')
-        adata = CrAnData.open_zarr(str(backed_path))
+        # reopen to refresh xarray coords / dims
+        adata = CrAnData.open_zarr(path)
 
-    X = _add_x_to_ds(
-        adata,
-        bw_files, consensus_peaks, target, target_region_width,
-        obs_index=obs_df.index, var_index=var_df.index,
-        chunk_size=chunk_size, n_bins=n_bins,tile_size=tile_size,
-        backend=backend
-    )
-
-    adata.attrs['chromsizes_file'] = str(chromsizes_file)
-    adata.attrs['target'] = target
-    adata.attrs['target_region_width'] = target_region_width
-    adata.attrs['shifted_region_width'] = target_region_width + 2 * max_stochastic_shift
-    adata.attrs['max_stochastic_shift'] = max_stochastic_shift
-    adata.attrs['chunk_size'] = chunk_size
-    adata['X'] = adata['X'].chunk({'obs':adata.dims['obs'],'var':chunk_size,'seq_bins':adata.dims['seq_bins']}) #enforce the same as before
-    # print('X chunks',adata['X'].chunksizes)
-    if backend=='icechunk':
-        adata.to_icechunk(mode='a',commit_name='import_bigwigs')
-        adata = CrAnData.open_icechunk(str(backed_path))
-    else:
-        adata.to_zarr(str(backed_path),mode='a')
-        adata = CrAnData.open_zarr(str(backed_path))
     return adata
 
 # -----------------------
 # Additional utility functions
 # -----------------------
-def prepare_intervals(adata):
+def prepare_intervals(
+    adata: CrAnData,
+    var_dim: str,
+    *,
+    chrom_suffix: str = "chrom",
+    start_suffix: str = "start",
+    end_suffix:   str = "end",
+    index_suffix: str = "index",
+) -> dict[str, list[tuple[int,int,str]]]:
     """
-    Prepare sorted interval data structures from adata.sizes['var']
-    Assumes adata.var has columns "chrom", "start", and "end".
-    Returns a dictionary {chrom: [(start, end, var_name), ... sorted by start]}.
+    From adata, pull out the columns
+      {var_dim}-_-{chrom,start,end,index}
+    and return {chrom: [(start,end,var_name),…] sorted by start}.
     """
-    df = pd.DataFrame({
-        "chrom": adata["var-_-chrom"].data.astype(str),
-        "start": adata["var-_-start"].data,
-        "end": adata["var-_-end"].data
-    }, index=adata['var-_-index'].data)
-    df = df.sort_values(["chrom", "start"])
+    chrom_col = f"{var_dim}-_-{chrom_suffix}"
+    start_col = f"{var_dim}-_-{start_suffix}"
+    end_col   = f"{var_dim}-_-{end_suffix}"
+    idx_col   = f"{var_dim}-_-{index_suffix}"
 
-    chrom_intervals = defaultdict(list)
-    for idx, row in df.iterrows():
-        chrom_intervals[row["chrom"]].append((row["start"], row["end"], idx))
-    return dict(chrom_intervals)
+    df = pd.DataFrame({
+        "chrom": adata[chrom_col].values.astype(str),
+        "start": adata[start_col].values.astype(int),
+        "end":   adata[end_col].values.astype(int),
+    }, index=adata[idx_col].values)
+    df = df.sort_values(["chrom","start"])
+
+    out: dict[str, list[tuple[int,int,str]]] = defaultdict(list)
+    for var_name, row in df.iterrows():
+        out[row["chrom"]].append((row["start"], row["end"], var_name))
+    return dict(out)
+
+
+# ——————————————————————————————————————————————————————————
+# 2) overlap‐finding on sorted intervals (unchanged)
+# ——————————————————————————————————————————————————————————
 
 def _find_overlaps_in_sorted_bed(bed_df, chrom_intervals):
-    """
-    Given a bed_df with columns ["chrom", "start", "end", "row_idx"] sorted by (chr, start)
-    and a dictionary of sorted intervals, returns a dict: {row_idx -> [var_names overlapping]}.
-    """
     row_to_overlaps = defaultdict(list)
-    chrom_positions = defaultdict(int)
+    chrom_pos = defaultdict(int)
     for _, row in bed_df.iterrows():
-        chrom = row["chrom"]
-        start_q = row["start"]
-        end_q = row["end"]
-        row_idx = row["row_idx"]
+        chrom     = row["chrom"]
+        start_q   = row["start"]
+        end_q     = row["end"]
+        row_idx   = row["row_idx"]
         intervals = chrom_intervals.get(chrom, [])
-        pos = chrom_positions.get(chrom, 0)
+        pos       = chrom_pos.get(chrom, 0)
+        # skip intervals ending before query
         while pos < len(intervals) and intervals[pos][1] < start_q:
             pos += 1
-        scan_pos = pos
-        while scan_pos < len(intervals) and intervals[scan_pos][0] < end_q:
-            (_, _, var_name) = intervals[scan_pos]
-            row_to_overlaps[row_idx].append(var_name)
-            scan_pos += 1
-        chrom_positions[chrom] = scan_pos
+        scan = pos
+        # collect overlaps
+        while scan < len(intervals) and intervals[scan][0] < end_q:
+            row_to_overlaps[row_idx].append(intervals[scan][2])
+            scan += 1
+        chrom_pos[chrom] = scan
     return row_to_overlaps
 
 def _find_overlaps_for_bedp(bedp_df, chrom_intervals, coord_col_prefix):
-    """
-    Given a bedp dataframe and a coordinate prefix (e.g. "chr1","start1","end1"),
-    build a mapping (row index -> list of overlapping var names).
-    """
-    df = bedp_df[[f"{coord_col_prefix}", f"start{coord_col_prefix[-1]}", f"end{coord_col_prefix[-1]}", "row_idx"]].copy()
-    df = df.rename(columns={
+    # identical to before — can stay unchanged
+    df = bedp_df[[
+        f"{coord_col_prefix}", 
+        f"start{coord_col_prefix[-1]}",
+        f"end{coord_col_prefix[-1]}", 
+        "row_idx"
+    ]].copy().rename(columns={
         f"{coord_col_prefix}": "chrom",
         f"start{coord_col_prefix[-1]}": "start",
         f"end{coord_col_prefix[-1]}": "end"
-    })
-    df = df.sort_values(["chrom", "start"]).reset_index(drop=True)
+    }).sort_values(["chrom","start"]).reset_index(drop=True)
     return _find_overlaps_in_sorted_bed(df, chrom_intervals)
 
-def add_contact_strengths_to_varp(adata, bedp_files, key="hic_contacts"):
+
+# ——————————————————————————————————————————————————————————
+# 3) generic “add contact strengths” API
+# ——————————————————————————————————————————————————————————
+
+def add_contact_strengths_to_varp(
+    adata: CrAnData,
+    bedp_files: list[Path]|Path,
+    *,
+    array_name: str,
+    var_dim: str,
+    var_target_dim: str,
+    obs_dim: str,
+    chrom_suffix: str = "chrom",
+    start_suffix: str = "start",
+    end_suffix:   str = "end",
+    index_suffix: str = "index",
+) -> CrAnData:
     """
-    Read Hi-C BEDP files and add a Hi-C contact data array into adata.varp[key].
-    Computes overlaps with adata.var (consensus regions) and builds a 3D array,
-    then wraps it in an xarray DataArray.
+    For each BEDP in bedp_files, find overlaps against adata’s var_dim intervals,
+    accumulate (i,j,obs,score) tuples, and assemble a sparse COO of shape
+      (n_var, n_var, n_obs),
+    then wrap in an xarray.DataArray with dims [var_dim, var_target_dim, obs_dim]
+    under adata.data_vars[array_name].
     """
-    # if "chrom" not in adata.sizes['var']columns:
-    #     var_index = adata['var-_-index'].astype(str)
-    #     adata.var["chrom"] = var_index.str.split(":").str[0]
-    #     adata.var["start"] = var_index.str.split(":").str[1].str.split("-").str[0].astype(np.int64)
-    #     adata.var["end"] = var_index.str.split(":").str[1].str.split("-").str[1].astype(np.int64)
-
-    chrom_intervals = prepare_intervals(adata)
-    num_bins = adata.sizes['var']
-    num_files = len(bedp_files)
-    var_name_to_i = {v: i for i, v in enumerate(adata['var-_-index'].data)}
-
-    all_rows = []
-    all_cols = []
-    all_file_idx = []
-    all_data = []
-
-    for fidx, bedp_file in enumerate(bedp_files):
-        bedp_df = pd.read_csv(
-            bedp_file, sep="\t", header=None,
-            names=["chr1", "start1", "end1", "chr2", "start2", "end2", "score"]
-        ).reset_index(drop=True)
-        bedp_df["row_idx"] = bedp_df.index
-
-        # Process first coordinate.
-        bedp_first = (
-            bedp_df[["chr1", "start1", "end1", "row_idx"]]
-            .rename(columns={"chr1": "chrom", "start1": "start", "end1": "end"})
-            .sort_values(["chrom", "start"])
-            .reset_index(drop=True)
-        )
-        # Process second coordinate.
-        bedp_second = (
-            bedp_df[["chr2", "start2", "end2", "row_idx"]]
-            .rename(columns={"chr2": "chrom", "start2": "start", "end2": "end"})
-            .sort_values(["chrom", "start"])
-            .reset_index(drop=True)
-        )
-
-        overlaps_first = _find_overlaps_in_sorted_bed(bedp_first, chrom_intervals)
-        overlaps_second = _find_overlaps_in_sorted_bed(bedp_second, chrom_intervals)
-
-        for row_idx, row in bedp_df.iterrows():
-            ovs1 = overlaps_first.get(row_idx, [])
-            ovs2 = overlaps_second.get(row_idx, [])
-            if not ovs1 or not ovs2:
-                continue
-            ovs1_int = [var_name_to_i[v] for v in ovs1 if v in var_name_to_i]
-            ovs2_int = [var_name_to_i[v] for v in ovs2 if v in var_name_to_i]
-            for i_idx in ovs1_int:
-                for j_idx in ovs2_int:
-                    all_rows.append(i_idx)
-                    all_cols.append(j_idx)
-                    all_file_idx.append(fidx)
-                    all_data.append(float(row["score"]))
-
-    if all_rows:
-        all_rows = np.array(all_rows, dtype=np.int64)
-        all_cols = np.array(all_cols, dtype=np.int64)
-        all_file_idx = np.array(all_file_idx, dtype=np.int64)
-        all_data = np.array(all_data, dtype=np.float32)
-    else:
-        all_rows = np.array([0], dtype=np.int64)
-        all_cols = np.array([0], dtype=np.int64)
-        all_file_idx = np.array([0], dtype=np.int64)
-        all_data = np.array([0], dtype=np.float32)
-
-    size = (num_bins, num_bins, num_files)
-    indices = np.stack([all_rows, all_cols, all_file_idx], axis=0)
-    contacts_tensor = sparse.COO(indices, all_data, shape=size)
-
-    contacts_xr = xr.DataArray(
-        contacts_tensor,
-        dims=["var", "var_target", "obs"],
-        coords={
-            "var": np.array(adata['var-_-index'].data),
-            "var_target": np.array(adata['var-_-index'].data),
-            "obs": np.array([os.path.basename(x).replace('.bedp','') for x in bedp_files])
-        }
+    # 1) build chrom→intervals
+    chrom_intervals = prepare_intervals(
+        adata, var_dim,
+        chrom_suffix=chrom_suffix,
+        start_suffix=start_suffix,
+        end_suffix=end_suffix,
+        index_suffix=index_suffix,
     )
-    adata[f"varp-_-{key}"] = contacts_xr
+
+    # 2) precompute sizes and index maps
+    n_var       = adata.sizes[var_dim]
+    bedp_list   = list(map(Path, bedp_files))
+    n_obs       = len(bedp_list)
+    var_index   = adata[f"{var_dim}-_-{index_suffix}"].values.astype(str)
+    var_to_idx  = {v:i for i,v in enumerate(var_index)}
+
+    rows = []
+    cols = []
+    obs  = []
+    dat  = []
+
+    # 3) loop BEDP files
+    for obs_idx, path in enumerate(bedp_list):
+        df = pd.read_csv(
+            path, sep="\t", header=None,
+            names=["chr1","start1","end1","chr2","start2","end2","score"]
+        )
+        df["row_idx"] = df.index
+
+        # find overlaps for each end
+        overlaps1 = _find_overlaps_for_bedp(df, chrom_intervals, "chr1")
+        overlaps2 = _find_overlaps_for_bedp(df, chrom_intervals, "chr2")
+
+        for _, row in df.iterrows():
+            o1 = overlaps1.get(int(row["row_idx"]), [])
+            o2 = overlaps2.get(int(row["row_idx"]), [])
+            if not o1 or not o2:
+                continue
+            sc = float(row["score"])
+            for v1 in o1:
+                i1 = var_to_idx.get(v1)
+                if i1 is None: continue
+                for v2 in o2:
+                    i2 = var_to_idx.get(v2)
+                    if i2 is None: continue
+                    rows.append(i1)
+                    cols.append(i2)
+                    obs.append(obs_idx)
+                    dat.append(sc)
+
+    # 4) build sparse COO (even if no contacts, produce a dummy zero)
+    if len(rows)==0:
+        rows = np.array([0], dtype=int)
+        cols = np.array([0], dtype=int)
+        obs  = np.array([0], dtype=int)
+        dat  = np.array([0.0], dtype=float)
+    else:
+        rows = np.array(rows, dtype=int)
+        cols = np.array(cols, dtype=int)
+        obs  = np.array(obs,  dtype=int)
+        dat  = np.array(dat,  dtype=float)
+
+    shape = (n_var, n_var, n_obs)
+    coords = {
+        var_dim:        var_index,
+        var_target_dim: var_index,
+        obs_dim:        [p.stem for p in bedp_list],
+    }
+    dims = [var_dim, var_target_dim, obs_dim]
+
+    coo = sparse.COO( np.vstack([rows,cols,obs]), dat, shape=shape )
+    da  = xr.DataArray(coo, dims=dims, coords=coords)
+
+    # 5) insert into the CrAnData
+    adata[array_name] = da
+    return adata

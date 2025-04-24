@@ -98,11 +98,10 @@ def create_one_hot_encoded_array(
     
     # Stack all sequences into a numpy array of shape (n_ranges, seq_length, 4)
     encoded_array = np.stack(sequences, axis=0)
-    # Create an xarray DataArray; we use dims ["var", "seq_len", "nuc"] where "nuc" has length 4.
-    da = xr.DataArray(encoded_array, dims=["var", "seq_len", "nuc"])
+    da = xr.DataArray(encoded_array)
     return da
 
-def add_genome_sequences_to_crandata(adata: xr.Dataset, ranges_df: pd.DataFrame, genome, key: str = "sequences", seq_length: int = None) -> xr.Dataset:
+def add_genome_sequences_to_crandata(adata: xr.Dataset, ranges_df: pd.DataFrame, genome, key: str = "sequences",dimnames = ('var','seq_len','nuc',), seq_length: int = None) -> xr.Dataset:
     """
     Create a one-hot encoded array of genomic sequences using the provided genome and ranges,
     add it to the CrAnData (an xarray.Dataset) under the specified key (default 'sequences'),
@@ -120,6 +119,7 @@ def add_genome_sequences_to_crandata(adata: xr.Dataset, ranges_df: pd.DataFrame,
         Key under which to store the one-hot encoded array in adata. Default is 'sequences'.
     seq_length : int, optional
         The sequence length to fetch. If None, it is inferred from ranges_df.
+    dimnames: list or tuple of length 3 naming your var, and sequence length and nucleotide dimensions.
     
     Returns
     -------
@@ -128,8 +128,8 @@ def add_genome_sequences_to_crandata(adata: xr.Dataset, ranges_df: pd.DataFrame,
     """
     # Create the one-hot encoded DataArray.
     da = create_one_hot_encoded_array(ranges_df, genome, seq_length=seq_length)
-
-    adata[key] = da.chunk({'var':adata.attrs['chunk_size'],'seq_len':seq_length,'nuc':4})
+    da = da.rename(dict(zip(da.dims,dimnames)))
+    adata[key] = da.chunk({dimnames[0]:adata.attrs['chunk_size'],dimnames[1]:seq_length,dimnames[2]:4})
     
     # Store key genome metadata in the dataset's attributes.
     adata.attrs["genome_name"] = genome.name
@@ -232,7 +232,7 @@ def reverse_complement(sequence: str | list[str] | np.ndarray) -> str | np.ndarr
         )
 
 class DNATransform:
-    def __init__(self, out_len: int, random_rc: bool = False, max_shift: int = None):
+    def __init__(self, out_len: int, random_rc: bool = False, max_shift: int = None, dimnames = ('var','seq_len','nuc',)):
         """
         Initialize a DNATransform.
 
@@ -249,6 +249,7 @@ class DNATransform:
         self.out_len = out_len
         self.random_rc = random_rc
         self.max_shift_param = max_shift
+        self.dimnames = dimnames
 
     def get_window_indices(self, seq_len: int, shift: int = 0) -> (int, int):
         """
@@ -279,7 +280,7 @@ class DNATransform:
 
     def get_window_indices_and_rc(self, da: xr.DataArray, shift: int = None):
         """
-        Given a one-hot encoded DataArray (with dims ["var", "seq_len", "nuc"]),
+        Given a one-hot encoded DataArray (with dims [self.dimnames[0], self.dimnames[1], self.dimnames[2]]),
         compute the indices for window extraction and return the indices along with
         a boolean array indicating which samples should be reverse complemented.
 
@@ -300,18 +301,18 @@ class DNATransform:
         """
         if shift is None:
             shift = 0
-        seq_len = da.sizes["seq_len"]
+        seq_len = da.sizes[self.dimnames[1]]
         start, end = self.get_window_indices(seq_len, shift)
         if self.random_rc:
-            rc_flags = np.random.rand(da.sizes["var"]) < 0.5
+            rc_flags = np.random.rand(da.sizes[self.dimnames[0]]) < 0.5
         else:
-            rc_flags = np.zeros(da.sizes["var"], dtype=bool)
+            rc_flags = np.zeros(da.sizes[self.dimnames[0]], dtype=bool)
         return start, end, rc_flags
 
     def reverse_complement(self, da):
         """
         Reverse complement a one-hot encoded sequence or batch DataSet.
-        Assumes that the DataArray has dims ["seq_len", "nuc"].
+        Assumes that the DataArray has dims [self.dimnames[1], self.dimnames[2]].
         The reverse complement is implemented by reversing the order along
         the 'seq_len' dimension and swapping the nucleotide channels (e.g. ACGT → TGCA).
         """
@@ -325,9 +326,9 @@ class DNATransform:
         Parameters
         ----------
         window : xarray.DataArray
-            DataArray with dimensions ["var", "seq_len", "nuc"] representing the extracted window.
+            DataArray with dimensions [self.dimnames[0], self.dimnames[1], self.dimnames[2]] representing the extracted window.
         rc_flags : numpy.ndarray
-            Boolean array of length equal to window.sizes["var"] indicating which samples
+            Boolean array of length equal to window.sizes[self.dimnames[0]] indicating which samples
             should be reverse complemented.
 
         Returns
@@ -338,9 +339,9 @@ class DNATransform:
         if not self.random_rc:
             return window
         samples = []
-        for i in range(window.sizes["var"]):
+        for i in range(window.sizes[self.dimnames[0]]):
             sample = window.isel(var=i)
             if rc_flags[i]:
                 sample = self.reverse_complement(sample)
             samples.append(sample)
-        return xr.concat(samples, dim="var")
+        return xr.concat(samples, dim=self.dimnames[0])

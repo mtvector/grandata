@@ -4,6 +4,7 @@ config_orig.py
 
 *.h5
 *.zarr
+*.ipynb
 
 # VS Code workspace config
 *.code-workspace

@@ -167,8 +167,8 @@ class CrAnDataModule:
 
         # ─ build state‐specific instructions once ────────────────────────────
         self.instructions = {
-            "train":   {"apply_rc": True,  "shuffle": shuffle},
-            "val":     {"apply_rc": True,  "shuffle": shuffle},
+            "train":   {"apply_rc": True,  "shuffle": self.shuffle},
+            "val":     {"apply_rc": True,  "shuffle": self.shuffle},
             "test":    {"apply_rc": False, "shuffle": False},
             "predict": {"apply_rc": False, "shuffle": False},
         }

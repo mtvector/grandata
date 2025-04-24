@@ -24,7 +24,7 @@ class CrAnData(xr.Dataset):
         """
         Create a CrAnData object as a thin wrapper of xarray.Dataset.
         You can use get_dataframe('var') or 'obs' etc to get hierarchical variables
-        as a grouped dataframe (the separator is -_- ...idk).
+        grouped into dataframe (the separator is -_- ...idk).
         Also automatically stores and reloads sparse arrays.
         """
         self.session = None
@@ -39,7 +39,6 @@ class CrAnData(xr.Dataset):
         for key in data_vars.keys():
             if key in data_vars and isinstance(data_vars[key], pd.DataFrame):
                 df = data_vars.pop(key)
-                # For each column in the DataFrame, create a new data variable using key "obs-_-<col>"
                 for col in df.columns:
                     data_vars[f"{key}-_-{col}"] = xr.DataArray(df[col].values, dims=(key,))
                 # Optionally, you can store the original index as a coordinate.
@@ -63,24 +62,32 @@ class CrAnData(xr.Dataset):
     @property
     def array_names(self):
         return list(self.data_vars.keys())
-    
+        
     def get_dataframe(self, top):
         cols = {}
         expected = None
-        # Gather all keys that start with "top-_-".
+        # Gather all keys that start with "top-_-"
         for key in list(self.data_vars.keys()):
-            if key.startswith(top + "-_-"):
-                da = super().__getitem__(key)
-                if expected is None:
-                    expected = da.shape[0]
-                elif da.shape[0] != expected:
-                    continue  # skip keys with mismatched length
-                col_name = key.split("-_-", 1)[1]
-                cols[col_name] = da.values
-        if cols:
-            return pd.DataFrame(cols, index=np.arange(expected))
-        else:
+            if not key.startswith(top + "-_-"):
+                continue
+            da = super().__getitem__(key)
+            if expected is None:
+                expected = da.shape[0]
+            elif da.shape[0] != expected:
+                continue  # skip keys with mismatched length
+            col_name = key.split("-_-", 1)[1]
+            cols[col_name] = da.values
+    
+        if not cols:
             return None
+    
+        # Look for any column name containing "index"
+        index_col = next((name for name in cols if name in ("index", "_index")), None)
+        if index_col is not None:
+            idx = cols.pop(index_col)
+            return pd.DataFrame(cols, index=idx)
+        else:
+            return pd.DataFrame(cols, index=np.arange(expected))
     
     # === Sparse encoding/decoding methods ===
     @staticmethod

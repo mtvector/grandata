@@ -25,7 +25,7 @@ dependencies = [
     # "anndata",
     # "crested",
     "xarray",
-    "torch",
+    #"torch",
     "torchdata",
     "zarr>=3.0.0",
     "pybigtools",
@@ -33,6 +33,7 @@ dependencies = [
     "numpy",
     "pybigtools",
     "tqdm",
+    "ete3",
     "pyfaidx"
 ]
 
