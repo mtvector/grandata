@@ -8,13 +8,13 @@ import pytest
 import xarray as xr
 import pybigtools  # Use pybigtools instead of pyBigWig
 
-from crandata.crandata import CrAnData
-from crandata.chrom_io import import_bigwigs, add_contact_strengths_to_varp
-from crandata._genome import Genome
-from crandata._anndatamodule import MetaAnnDataModule
-from crandata._dataloader import AnnDataLoader
-from crandata.utils import hot_encoding_to_sequence
-from crandata.chrom_io import import_bigwigs
+from grandata.grandata import GRAnData
+from grandata.chrom_io import import_bigwigs, add_contact_strengths_to_varp
+from grandata._genome import Genome
+from grandata._anndatamodule import MetaAnnDataModule
+from grandata._dataloader import AnnDataLoader
+from grandata.utils import hot_encoding_to_sequence
+from grandata.chrom_io import import_bigwigs
 
 # -----------------------------------------------------------------------------
 # Fixture for temporary test setup
@@ -77,7 +77,7 @@ def temp_setup(tmp_path: Path):
     }
 
 # -----------------------------------------------------------------------------
-# Test 1: CrAnData fields and properties
+# Test 1: GRAnData fields and properties
 # -----------------------------------------------------------------------------
 
 def test_yanndata_fields(tmp_path: Path):
@@ -91,7 +91,7 @@ def test_yanndata_fields(tmp_path: Path):
     varp = {"contacts": xr.DataArray(np.random.rand(5, 5), dims=["var_0", "var_1"])}
     obsp = {"adj": xr.DataArray(np.random.rand(4, 4), dims=["obs_0", "obs_1"])}
     
-    ydata = CrAnData(X, obs=obs, var=var, uns={"extra": "test"},
+    ydata = GRAnData(X, obs=obs, var=var, uns={"extra": "test"},
                      obsm=obsm, varm=varm, layers=layers, varp=varp, obsp=obsp)
     # Force axis_indices so that obs_names and var_names return proper values.
     ydata.axis_indices["obs"] = np.array(ydata.obs.index)
@@ -117,10 +117,10 @@ def test_obs_loaded_correctly(tmp_path: Path):
     X = xr.DataArray(np.arange(12).reshape(3, 4), dims=["obs", "var"])
     obs = pd.DataFrame({"col": [1, 2, 3]}, index=["o1", "o2", "o3"])
     var = pd.DataFrame({"col": [10, 20, 30, 40]}, index=["v1", "v2", "v3", "v4"])
-    ydata = CrAnData(X, obs=obs, var=var)
+    ydata = GRAnData(X, obs=obs, var=var)
     h5_path = tmp_path / "test_adata.h5"
     ydata.to_h5(str(h5_path))
-    ydata_loaded = CrAnData.from_h5(str(h5_path))
+    ydata_loaded = GRAnData.from_h5(str(h5_path))
     pd.testing.assert_frame_equal(ydata_loaded.obs, obs)
     pd.testing.assert_frame_equal(ydata_loaded.var, var)
 
@@ -132,7 +132,7 @@ def test_batches_composition():
     X = xr.DataArray(np.random.rand(6, 10), dims=["obs", "var"])
     obs = pd.DataFrame({"col": np.arange(6)}, index=[f"obs{i}" for i in range(6)])
     var = pd.DataFrame({"col": np.arange(10)}, index=[f"var{j}" for j in range(10)])
-    ydata = CrAnData(X, obs=obs, var=var)
+    ydata = GRAnData(X, obs=obs, var=var)
     ydata.axis_indices["obs"] = np.array(obs.index)
     ydata.axis_indices["var"] = np.array(var.index)
     

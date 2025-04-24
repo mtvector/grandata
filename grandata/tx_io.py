@@ -6,18 +6,18 @@ from scipy.sparse import csr_matrix
 import sparse
 from pathlib import Path
 from typing import Union, Literal, List
-from crandata import CrAnData
+from grandata import GRAnData
 
-def read_h5ad_selective_to_crandata(
+def read_h5ad_selective_to_grandata(
     filename: Union[str, Path],
     mode: Literal["r", "r+"] = "r",
     selected_fields: List[str] = None,
-) -> CrAnData:
+) -> GRAnData:
     """
     Read just the specified top‐level AnnData fields (e.g. "X","obs","var","layers", etc.)
     from an .h5ad file via h5py, reconstruct sparse/categorical if needed,
-    and return a CrAnData (xarray.Dataset).  This version unpacks obs/var
-    into -_- columns so we never pass a DataFrame into CrAnData.__init__.
+    and return a GRAnData (xarray.Dataset).  This version unpacks obs/var
+    into -_- columns so we never pass a DataFrame into GRAnData.__init__.
     """
     selected_fields = selected_fields or ["X", "obs", "var"]
 
@@ -190,7 +190,7 @@ def read_h5ad_selective_to_crandata(
 
                 data_vars[f"{grp}-_-{name}"] = xr.DataArray(arr, dims=dims, coords=c)
 
-    # ——— Finally, build and return CrAnData ——————————————————————
-    return CrAnData(data_vars=data_vars, coords=coords)
+    # ——— Finally, build and return GRAnData ——————————————————————
+    return GRAnData(data_vars=data_vars, coords=coords)
 
 

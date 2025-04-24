@@ -8,16 +8,16 @@ import pytest
 import xarray as xr
 import pybigtools  # Use pybigtools instead of pyBigWig
 
-from crandata.crandata import CrAnData
-from crandata.chrom_io import import_bigwigs, add_contact_strengths_to_varp
-from crandata._genome import Genome
-from crandata._anndatamodule import MetaAnnDataModule
-from crandata._dataloader import AnnDataLoader
-from crandata.utils import hot_encoding_to_sequence
-from crandata.chrom_io import import_bigwigs
+from grandata.grandata import GRAnData
+from grandata.chrom_io import import_bigwigs, add_contact_strengths_to_varp
+from grandata._genome import Genome
+from grandata._anndatamodule import MetaAnnDataModule
+from grandata._dataloader import AnnDataLoader
+from grandata.utils import hot_encoding_to_sequence
+from grandata.chrom_io import import_bigwigs
 
 # -----------------------------------------------------------------------------
-# Test 1: CrAnData fields and properties
+# Test 1: GRAnData fields and properties
 # -----------------------------------------------------------------------------
 
 def test_yanndata_fields(tmp_path: Path):
@@ -32,7 +32,7 @@ def test_yanndata_fields(tmp_path: Path):
     obsp = {"adj": xr.DataArray(np.random.rand(4, 4), dims=["obs_0", "obs_1"])}
 
     # Pass explicit axis_indices so that obs_names and var_names come from the DataFrame indices.
-    ydata = CrAnData(X, obs=obs, var=var, uns={"extra": "test"},
+    ydata = GRAnData(X, obs=obs, var=var, uns={"extra": "test"},
                      obsm=obsm, varm=varm, layers=layers, varp=varp, obsp=obsp,
                      axis_indices={"obs": obs.index.to_numpy(), "var": var.index.to_numpy()})
     
@@ -57,10 +57,10 @@ def test_obs_loaded_correctly(tmp_path: Path):
     X = xr.DataArray(np.arange(12).reshape(3, 4), dims=["obs", "var"])
     obs = pd.DataFrame({"col": [1, 2, 3]}, index=["o1", "o2", "o3"])
     var = pd.DataFrame({"col": [10, 20, 30, 40]}, index=["v1", "v2", "v3", "v4"])
-    ydata = CrAnData(X, obs=obs, var=var, axis_indices={"obs": obs.index.to_numpy(), "var": var.index.to_numpy()})
+    ydata = GRAnData(X, obs=obs, var=var, axis_indices={"obs": obs.index.to_numpy(), "var": var.index.to_numpy()})
     h5_path = tmp_path / "test_adata.h5"
     ydata.to_h5(str(h5_path))
-    ydata_loaded = CrAnData.from_h5(str(h5_path))
+    ydata_loaded = GRAnData.from_h5(str(h5_path))
     pd.testing.assert_frame_equal(ydata_loaded.obs, obs)
     pd.testing.assert_frame_equal(ydata_loaded.var, var)
 
@@ -72,12 +72,12 @@ def test_batches_composition():
     X = xr.DataArray(np.random.rand(6, 10), dims=["obs", "var"])
     obs = pd.DataFrame({"col": np.arange(6)}, index=[f"obs{i}" for i in range(6)])
     var = pd.DataFrame({"col": np.arange(10)}, index=[f"var{j}" for j in range(10)])
-    ydata = CrAnData(X, obs=obs, var=var, axis_indices={"obs": obs.index.to_numpy(), "var": var.index.to_numpy()})
+    ydata = GRAnData(X, obs=obs, var=var, axis_indices={"obs": obs.index.to_numpy(), "var": var.index.to_numpy()})
     
     # Create a dummy dataset that mimics __getitem__ of AnnDataset.
     class DummyDataset:
         def __init__(self, ydata):
-            # Mimic a real dataset by storing the CrAnData under 'adata'
+            # Mimic a real dataset by storing the GRAnData under 'adata'
             self.adata = ydata
             self.augmented_probs = np.ones(6)
             # Create an index_manager with augmented_indices equal to range(6)
@@ -105,15 +105,15 @@ def test_batches_composition():
         assert batch[key].shape[1] == 2
 
 # -----------------------------------------------------------------------------
-# Test 4: Backed files and lazy loading via CrAnData.from_h5
+# Test 4: Backed files and lazy loading via GRAnData.from_h5
 # -----------------------------------------------------------------------------
 
 def test_lazy_loading(tmp_path: Path):
     X = xr.DataArray(np.random.rand(50, 20), dims=["obs", "var"])
-    ydata = CrAnData(X)
+    ydata = GRAnData(X)
     h5_path = tmp_path / "lazy.h5"
     ydata.to_h5(str(h5_path))
-    ydata_loaded = CrAnData.from_h5(str(h5_path), backed=["X"])
+    ydata_loaded = GRAnData.from_h5(str(h5_path), backed=["X"])
     # Check that the loaded X contains a _lazy_obj attribute.
     lazy_obj = ydata_loaded.X.attrs.get("_lazy_obj")
     assert lazy_obj is not None, "Lazy object not found in attributes"
@@ -133,7 +133,7 @@ def test_dna_sequence_retrieval_and_shift(tmp_path: Path):
     
     dummy_genome = Genome(str(fasta_file), chrom_sizes=str(chromsizes_file))
     
-    from crandata._dataset import SequenceLoader
+    from grandata._dataset import SequenceLoader
     regions = ["chr1:100-110:+"]
     loader = SequenceLoader(dummy_genome, in_memory=True, always_reverse_complement=False,
                               deterministic_shift=False, max_stochastic_shift=5, regions=regions)

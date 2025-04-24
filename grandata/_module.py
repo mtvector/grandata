@@ -65,9 +65,9 @@ class DNATransformApplicator:
                 batch = batch.isel(idx)
         return batch
 
-class CrAnDataModule:
+class GRAnDataModule:
     """
-    A unified data‐loading module for one or more CrAnData xarray.Datasets that produces
+    A unified data‐loading module for one or more GRAnData xarray.Datasets that produces
     PyTorch‐compatible dataloaders for training, validation, testing, and prediction.
 
     This class supports:
@@ -79,8 +79,8 @@ class CrAnDataModule:
 
     Parameters
     ----------
-    adatas : Sequence[CrAnData]
-        One or more CrAnData objects to draw samples from. If a single dataset is provided,
+    adatas : Sequence[GRAnData]
+        One or more GRAnData objects to draw samples from. If a single dataset is provided,
         it will behave like a standard DataModule; if multiple, samples are drawn according
         to `weights` and mixed at each batch.
     batch_size : int
@@ -111,7 +111,7 @@ class CrAnDataModule:
 
     Attributes
     ----------
-    modules : List[CrAnDataModule]
+    modules : List[GRAnDataModule]
         Underlying single‐dataset modules, one per entry in `adatas`.
     global_coords : Dict[str, np.ndarray]
         Unified coordinate arrays computed from all datasets, used for reindexing.
@@ -262,10 +262,10 @@ class CrAnDataModule:
         return self._get_dataloader("predict")
 
     def load(self):
-        """Bring all underlying CrAnData into memory if supported."""
+        """Bring all underlying GRAnData into memory if supported."""
         for ds in self.adatas:
             ds.load()
 
     def __repr__(self):
-        return (f"CrAnDataModule(num_datasets={len(self.adatas)}, "
+        return (f"GRAnDataModule(num_datasets={len(self.adatas)}, "
                 f"batch_size={self.batch_size}, shuffle={self.shuffle})")

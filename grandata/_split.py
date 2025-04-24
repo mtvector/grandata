@@ -8,7 +8,7 @@ from collections import defaultdict
 
 import numpy as np
 import pandas as pd
-from .crandata import CrAnData
+from .grandata import GRAnData
 import xarray as xr
 from loguru import logger
 
@@ -189,7 +189,7 @@ def _split_by_regions(
 
 
 def train_val_test_split(
-    adata: CrAnData,
+    adata: GRAnData,
     strategy: str = "region",
     val_size: float = 0.1,
     test_size: float = 0.1,
@@ -199,9 +199,9 @@ def train_val_test_split(
     random_state: None | int = None,
 ) -> None:
     """
-    Add 'train/val/test' split column to CrAnData object.
+    Add 'train/val/test' split column to GRAnData object.
 
-    Adds a new column `split` to the `.var` DataFrame of the CrAnData object,
+    Adds a new column `split` to the `.var` DataFrame of the GRAnData object,
     indicating whether each sample should be part of the training, validation, or test set
     based on the chosen splitting strategy.
 
@@ -212,9 +212,9 @@ def train_val_test_split(
     Parameters
     ----------
     adata
-        CrAnData object to which the 'train/val/test' split column will be added.
+        GRAnData object to which the 'train/val/test' split column will be added.
     strategy
-        strategy of split. Either 'region', 'chr' or 'chr_auto'. If 'chr' or 'chr_auto', the CrAnData's var_names should
+        strategy of split. Either 'region', 'chr' or 'chr_auto'. If 'chr' or 'chr_auto', the GRAnData's var_names should
         contain the chromosome name at the start, followed by a `:` (e.g. I:2000-2500 or chr3:10-20:+).
 
         region: Split randomly on region indices.

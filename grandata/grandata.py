@@ -13,7 +13,7 @@ except ImportError:
     print("no sparse")
     sparse = None
 
-class CrAnData(xr.Dataset):
+class GRAnData(xr.Dataset):
     __slots__ = ("__dict__","session","repo")  # remove always_convert_df from slots
 
     def __init__(self, 
@@ -22,7 +22,7 @@ class CrAnData(xr.Dataset):
                  session=None,
                  **kwargs):
         """
-        Create a CrAnData object as a thin wrapper of xarray.Dataset.
+        Create a GRAnData object as a thin wrapper of xarray.Dataset.
         You can use get_dataframe('var') or 'obs' etc to get hierarchical variables
         grouped into dataframe (the separator is -_- ...idk).
         Also automatically stores and reloads sparse arrays.

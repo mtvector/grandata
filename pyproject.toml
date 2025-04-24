@@ -6,7 +6,7 @@ requires = [
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "crandata"
+name = "grandata"
 version = "0.1"
 description = "CREsted-style genome-track data management backed by XArray."
 readme = { file = "README.md", "content-type" = "text/markdown" }
@@ -38,7 +38,7 @@ dependencies = [
 ]
 
 [project.urls]
-"Source" = "https://github.com/mtvector/crandata"
+"Source" = "https://github.com/mtvector/grandata"
 
 [tool.setuptools]
 packages = { find = {} }

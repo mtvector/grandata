@@ -101,16 +101,16 @@ def create_one_hot_encoded_array(
     da = xr.DataArray(encoded_array)
     return da
 
-def add_genome_sequences_to_crandata(adata: xr.Dataset, ranges_df: pd.DataFrame, genome, key: str = "sequences",dimnames = ('var','seq_len','nuc',), seq_length: int = None) -> xr.Dataset:
+def add_genome_sequences_to_grandata(adata: xr.Dataset, ranges_df: pd.DataFrame, genome, key: str = "sequences",dimnames = ('var','seq_len','nuc',), seq_length: int = None) -> xr.Dataset:
     """
     Create a one-hot encoded array of genomic sequences using the provided genome and ranges,
-    add it to the CrAnData (an xarray.Dataset) under the specified key (default 'sequences'),
+    add it to the GRAnData (an xarray.Dataset) under the specified key (default 'sequences'),
     and store genome metadata in the Dataset's attributes for later retrieval.
     
     Parameters
     ----------
     adata : xr.Dataset
-        CrAnData object represented as an xarray.Dataset.
+        GRAnData object represented as an xarray.Dataset.
     ranges_df : pd.DataFrame
         DataFrame with genomic ranges. Expected columns: 'chrom', 'start', 'end', and optionally 'strand'.
     genome
@@ -124,7 +124,7 @@ def add_genome_sequences_to_crandata(adata: xr.Dataset, ranges_df: pd.DataFrame,
     Returns
     -------
     xr.Dataset
-        Updated CrAnData object with the one-hot encoded array added as a data variable and genome metadata stored in attrs.
+        Updated GRAnData object with the one-hot encoded array added as a data variable and genome metadata stored in attrs.
     """
     # Create the one-hot encoded DataArray.
     da = create_one_hot_encoded_array(ranges_df, genome, seq_length=seq_length)

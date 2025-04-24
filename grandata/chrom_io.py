@@ -11,7 +11,7 @@ from tqdm import tqdm
 import xarray as xr
 import zarr
 
-from .crandata import CrAnData
+from .grandata import GRAnData
 from collections import defaultdict
 try:
     import sparse
@@ -54,10 +54,10 @@ def _extract_bw(
         return arr.astype("float32")
 
 # ——————————————————————————————————————————————————————————
-# public API #1: create brand-new CrAnData from a peaks-DF
+# public API #1: create brand-new GRAnData from a peaks-DF
 # ——————————————————————————————————————————————————————————
 
-def crandata_from_bigwigs(
+def grandata_from_bigwigs(
     region_table: pd.DataFrame,
     bigwig_dir: Path|str,
     backed_path: Path|str,
@@ -72,9 +72,9 @@ def crandata_from_bigwigs(
     n_bins: int = 1,
     backend: str = "zarr",
     tile_size: int = 5000,
-) -> CrAnData:
+) -> GRAnData:
     """
-    Create a new CrAnData from region_table and a folder of BigWigs.
+    Create a new GRAnData from region_table and a folder of BigWigs.
     The resulting store is written to `backed_path`, and a first array
     named `array_name` is streamed in along dims (obs_dim, var_dim, seq_dim).
     """
@@ -120,7 +120,7 @@ def crandata_from_bigwigs(
               .chunk({var_dim: chunk_size})
         )
 
-    adata = CrAnData(**extra)
+    adata = GRAnData(**extra)
     adata.attrs['chunk_size'] = chunk_size
 
     # 4) initialize the on‐disk store
@@ -128,7 +128,7 @@ def crandata_from_bigwigs(
         adata.to_icechunk(str(backed_path), mode="w")
     else:
         adata.to_zarr(str(backed_path), mode="w")
-        adata = CrAnData.open_zarr(str(backed_path))
+        adata = GRAnData.open_zarr(str(backed_path))
 
     # 5) stream in the very first array
     return add_bigwig_array(
@@ -148,11 +148,11 @@ def crandata_from_bigwigs(
     )
 
 # ——————————————————————————————————————————————————————————
-# public API #2: append a new array from bigwigs into an existing CrAnData
+# public API #2: append a new array from bigwigs into an existing GRAnData
 # ——————————————————————————————————————————————————————————
 
 def add_bigwig_array(
-    adata: CrAnData,
+    adata: GRAnData,
     region_table: pd.DataFrame,
     bigwig_dir: Path|str|list[Path],
     *,
@@ -167,7 +167,7 @@ def add_bigwig_array(
     backend: str = "zarr",
     tile_size: int = 5000,
     fill_value = np.nan,
-) -> CrAnData:
+) -> GRAnData:
     # allow passing either a folder or pre-collected list
     if not isinstance(bigwig_dir, (list,tuple)):
         bigwig_dir = list(Path(bigwig_dir).iterdir())
@@ -250,7 +250,7 @@ def add_bigwig_array(
         adata.session = adata.repo.readonly_session("main")
     else:
         # reopen to refresh xarray coords / dims
-        adata = CrAnData.open_zarr(path)
+        adata = GRAnData.open_zarr(path)
 
     return adata
 
@@ -258,7 +258,7 @@ def add_bigwig_array(
 # Additional utility functions
 # -----------------------
 def prepare_intervals(
-    adata: CrAnData,
+    adata: GRAnData,
     var_dim: str,
     *,
     chrom_suffix: str = "chrom",
@@ -334,7 +334,7 @@ def _find_overlaps_for_bedp(bedp_df, chrom_intervals, coord_col_prefix):
 # ——————————————————————————————————————————————————————————
 
 def add_contact_strengths_to_varp(
-    adata: CrAnData,
+    adata: GRAnData,
     bedp_files: list[Path]|Path,
     *,
     array_name: str,
@@ -345,7 +345,7 @@ def add_contact_strengths_to_varp(
     start_suffix: str = "start",
     end_suffix:   str = "end",
     index_suffix: str = "index",
-) -> CrAnData:
+) -> GRAnData:
     """
     For each BEDP in bedp_files, find overlaps against adata’s var_dim intervals,
     accumulate (i,j,obs,score) tuples, and assemble a sparse COO of shape
@@ -426,6 +426,6 @@ def add_contact_strengths_to_varp(
     coo = sparse.COO( np.vstack([rows,cols,obs]), dat, shape=shape )
     da  = xr.DataArray(coo, dims=dims, coords=coords)
 
-    # 5) insert into the CrAnData
+    # 5) insert into the GRAnData
     adata[array_name] = da
     return adata

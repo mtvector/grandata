@@ -4,12 +4,12 @@ import xarray as xr
 import h5py
 from pathlib import Path
 import pytest
-from crandata.crandata import CrAnData
+from grandata.grandata import GRAnData
 
 # -----------------------------------------------------------------------------
-# Test 1: CrAnData fields and dynamic axis properties
+# Test 1: GRAnData fields and dynamic axis properties
 # -----------------------------------------------------------------------------
-def test_crandata_fields_and_properties(tmp_path: Path):
+def test_grandata_fields_and_properties(tmp_path: Path):
     # Create dummy data for all fields.
     X = xr.DataArray(np.arange(20).reshape(4, 5), dims=["obs", "var"])
     obs = pd.DataFrame({"a": list("ABCD")}, index=["obs1", "obs2", "obs3", "obs4"])
@@ -20,8 +20,8 @@ def test_crandata_fields_and_properties(tmp_path: Path):
     varp = {"contacts": xr.DataArray(np.random.rand(5, 5), dims=["var_0", "var_1"])}
     obsp = {"adj": xr.DataArray(np.random.rand(4, 4), dims=["obs_0", "obs_1"])}
     
-    # Create CrAnData with axis_indices for the primary axes.
-    data = CrAnData(
+    # Create GRAnData with axis_indices for the primary axes.
+    data = GRAnData(
         X, obs=obs, var=var, uns={"extra": "test"},
         obsm=obsm, varm=varm, layers=layers, varp=varp, obsp=obsp,
         axis_indices={"obs": list(obs.index), "var": list(var.index)}
@@ -53,10 +53,10 @@ def test_hdf5_save_load(tmp_path: Path):
     X = xr.DataArray(np.arange(12).reshape(3, 4), dims=["obs", "var"])
     obs = pd.DataFrame({"col": [1, 2, 3]}, index=["o1", "o2", "o3"])
     var = pd.DataFrame({"col": [10, 20, 30, 40]}, index=["v1", "v2", "v3", "v4"])
-    data = CrAnData(X, obs=obs, var=var, axis_indices={"obs": list(obs.index), "var": list(var.index)})
+    data = GRAnData(X, obs=obs, var=var, axis_indices={"obs": list(obs.index), "var": list(var.index)})
     h5_path = tmp_path / "test_adata.h5"
     data.to_h5(str(h5_path))
-    loaded = CrAnData.from_h5(str(h5_path), backed=["X"])
+    loaded = GRAnData.from_h5(str(h5_path), backed=["X"])
     pd.testing.assert_frame_equal(loaded.obs, obs)
     pd.testing.assert_frame_equal(loaded.var, var)
     assert loaded.shape == data.shape
@@ -68,11 +68,11 @@ def test_hdf5_save_load(tmp_path: Path):
 # -----------------------------------------------------------------------------
 def test_to_memory(tmp_path: Path):
     X = xr.DataArray(np.arange(24).reshape(4,6), dims=["obs", "var"])
-    data = CrAnData(X, axis_indices={"obs": [f"o{i}" for i in range(4)],
+    data = GRAnData(X, axis_indices={"obs": [f"o{i}" for i in range(4)],
                                        "var": [f"v{i}" for i in range(6)]})
     h5_path = tmp_path / "lazy.h5"
     data.to_h5(str(h5_path))
-    lazy_data = CrAnData.from_h5(str(h5_path), backed=["X"])
+    lazy_data = GRAnData.from_h5(str(h5_path), backed=["X"])
     # Ensure primary array is lazy.
     assert hasattr(lazy_data._data["X"], "attrs") and "_lazy_obj" in lazy_data._data["X"].attrs
     # Convert all lazy arrays to in-memory.
@@ -86,11 +86,11 @@ def test_to_memory(tmp_path: Path):
 # -----------------------------------------------------------------------------
 def test_prevent_further_slicing(tmp_path: Path):
     X = xr.DataArray(np.arange(24).reshape(4,6), dims=["obs", "var"])
-    data = CrAnData(X, axis_indices={"obs": [f"o{i}" for i in range(4)],
+    data = GRAnData(X, axis_indices={"obs": [f"o{i}" for i in range(4)],
                                        "var": [f"v{i}" for i in range(6)]})
     h5_path = tmp_path / "sliced.h5"
     data.to_h5(str(h5_path))
-    lazy_data = CrAnData.from_h5(str(h5_path), backed=["X"])
+    lazy_data = GRAnData.from_h5(str(h5_path), backed=["X"])
     sliced = lazy_data[0:2]
     with pytest.raises(ValueError):
         _ = sliced[0:1]
@@ -100,7 +100,7 @@ def test_prevent_further_slicing(tmp_path: Path):
 # -----------------------------------------------------------------------------
 def test_add_property():
     X = xr.DataArray(np.arange(20).reshape(4,5), dims=["obs", "var"])
-    data = CrAnData(X, axis_indices={"obs": [f"o{i}" for i in range(4)],
+    data = GRAnData(X, axis_indices={"obs": [f"o{i}" for i in range(4)],
                                        "var": [f"v{i}" for i in range(5)]})
     new_prop = np.arange(8).reshape(4,2)
     data.add_property("new_feature", new_prop, dims=["obs", "feat"],
@@ -122,7 +122,7 @@ def test_dynamic_axis_properties():
     axis_indices = {"time": [f"t{i}" for i in range(3)],
                     "obs": [f"o{i}" for i in range(4)],
                     "var": [f"v{i}" for i in range(5)]}
-    data = CrAnData(X, axis_indices=axis_indices)
+    data = GRAnData(X, axis_indices=axis_indices)
     # Check dynamic axis coordinate properties.
     assert list(data.time_names) == [f"t{i}" for i in range(3)]
     assert list(data.obs_names) == [f"o{i}" for i in range(4)]
