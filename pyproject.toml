@@ -1,47 +1,43 @@
-[build-system]
-requires = [
-    "setuptools>=42",
-    "wheel"
-]
-build-backend = "setuptools.build_meta"
-
-[project]
-name = "grandata"
-version = "0.1"
+[tool.poetry]
+name        = "grandata"
+version     = "0.1.0"
 description = "CREsted-style genome-track data management backed by XArray."
-readme = { file = "README.md", "content-type" = "text/markdown" }
-requires-python = ">=3.10"
-
-classifiers = [
-    "Programming Language :: Python :: 3.12",
-    "Topic :: Scientific/Engineering :: Bio-Informatics"
+readme      = "README.md"
+authors     = ["Matthew Schmitz"]
+homepage    = "https://github.com/mtvector/grandata"
+repository  = "https://github.com/mtvector/grandata"
+license     = "MIT"
+packages = [
+  { include = "grandata" }
 ]
 
-authors = [
-  { name = "Matthew Schmitz" }
-]
+[[tool.poetry.source]]
+name     = "pytorch-cpu" #maybe improve compatibility with other frameworks?
+url      = "https://download.pytorch.org/whl/cpu"
+priority = "explicit"
 
-dependencies = [
-    # "anndata",
-    # "crested",
-    "xarray",
-    #"torch",
-    "torchdata",
-    "zarr>=3.0.0",
-    "pybigtools",
-    "pandas",
-    "numpy",
-    "pybigtools",
-    "tqdm",
-    "ete3",
-    "pyfaidx"
-]
+[tool.poetry.dependencies]
+python     = ">=3.11,<4.0"
+xarray     = "*"
+xbatcher   = "*"
+dask       = "*"
+icechunk   = "*"
+torch = { version = "^2.0.0", source = "pytorch-cpu" } #maybe improve compatibility with other frameworks?
+torchdata  = ">=0.11.0"
+zarr       = ">=3.0.0"
+pybigtools = ">=0.2.4"
+pandas     = "*"
+numpy      = "*"
+tqdm       = "*"
+ete3       = "*"
+pyfaidx    = "*"
+pysam      = "*"
+loguru     = "*"
 
-[project.urls]
-"Source" = "https://github.com/mtvector/grandata"
+[tool.poetry.group.dev.dependencies]
+pytest     = "^7.0"
+pyBigWig   = "*"
 
-[tool.setuptools]
-packages = { find = {} }
-
-# [tool.setuptools.packages.find]
-# exclude = ["tests*"]
+[build-system]
+requires    = ["poetry-core>=1.3.0"]
+build-backend = "poetry.core.masonry.api"

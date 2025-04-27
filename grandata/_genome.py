@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import errno
 import os
+import pandas as pd
 from pathlib import Path
 
 from loguru import logger
 from pysam import FastaFile
-
 from .seq_io import reverse_complement
 
+def _read_chromsizes(chromsizes_file: PathLike) -> dict[str, int]:
+    """Read chromsizes file into a dictionary."""
+    chromsizes = pd.read_csv(
+        chromsizes_file, sep="\t", header=None, names=["chrom", "size"]
+    )
+    chromsizes_dict = chromsizes.set_index("chrom")["size"].to_dict()
+    return chromsizes_dict
 
 class Genome:
     """
@@ -98,8 +105,6 @@ class Genome:
         if self._chrom_sizes is None:
             self._chrom_sizes = dict(zip(self.fasta.references, self.fasta.lengths))
         elif isinstance(self._chrom_sizes, Path):
-            from crested._io import _read_chromsizes
-
             self._chrom_sizes = _read_chromsizes(self._chrom_sizes)
         elif not isinstance(self._chrom_sizes, dict):
             raise ValueError("chrom_sizes must be a dictionary or a Path.")
