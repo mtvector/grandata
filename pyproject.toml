@@ -4,40 +4,46 @@ version     = "0.1.0"
 description = "CREsted-style genome-track data management backed by XArray."
 readme      = "README.md"
 authors     = ["Matthew Schmitz"]
-homepage    = "https://github.com/mtvector/grandata"
-repository  = "https://github.com/mtvector/grandata"
 license     = "MIT"
-packages = [
-  { include = "grandata" }
-]
+package-mode = true
 
-[[tool.poetry.source]]
-name     = "pytorch-cpu" #maybe improve compatibility with other frameworks?
-url      = "https://download.pytorch.org/whl/cpu"
-priority = "explicit"
 
 [tool.poetry.dependencies]
-python     = ">=3.11,<4.0"
-xarray     = "*"
-xbatcher   = "*"
-dask       = "*"
-icechunk   = "*"
-torch = { version = "^2.0.0", source = "pytorch-cpu" } #maybe improve compatibility with other frameworks?
-torchdata  = ">=0.11.0"
-zarr       = ">=3.0.0"
-pybigtools = ">=0.2.4"
-pandas     = "*"
-numpy      = "*"
-tqdm       = "*"
-ete3       = "*"
-pyfaidx    = "*"
-pysam      = "*"
-loguru     = "*"
+python      = ">=3.11,<4.0"
+xarray      = "*"
+xbatcher    = "*"
+dask        = "*"
+icechunk    = "*"
+zarr        = ">=3.0.0"
+pybigtools  = ">=0.2.4"
+pandas      = "*"
+numpy       = "*"
+tqdm        = "*"
+ete3        = "*"
+pyfaidx     = "*"
+torch       = { version = "^2.7", source = "pytorch-cpu", markers = "extra=='cpu' and extra!='cuda'" }
 
-[tool.poetry.group.dev.dependencies]
-pytest     = "^7.0"
-pyBigWig   = "*"
+
+    [tool.poetry.group.cuda]
+        optional = true
+
+        [tool.poetry.group.cuda.dependencies]
+            torch       = { version = "^2.7", source = "pytorch-cuda", markers = "extra=='cuda' and extra!='cpu'" }
+
+[tool.poetry.extras]
+    cpu  = ["torch"]
+    cuda = ["torch"]
+
+[[tool.poetry.source]]
+    name     = "pytorch-cuda"
+    priority = "explicit"
+    url      = "https://download.pytorch.org/whl/cu128"
+
+[[tool.poetry.source]]
+    name     = "pytorch-cpu"
+    priority = "explicit"
+    url      = "https://download.pytorch.org/whl/cpu"
 
 [build-system]
-requires    = ["poetry-core>=1.3.0"]
+requires      = ["poetry-core>=1.3.0"]
 build-backend = "poetry.core.masonry.api"

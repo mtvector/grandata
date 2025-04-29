@@ -5,6 +5,7 @@ config_orig.py
 *.h5
 *.zarr
 *.ipynb
+poetry.lock
 
 # VS Code workspace config
 *.code-workspace
