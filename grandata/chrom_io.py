@@ -10,6 +10,7 @@ import pybigtools
 from tqdm import tqdm
 import xarray as xr
 import zarr
+import re
 
 from .grandata import GRAnData
 from collections import defaultdict
@@ -38,40 +39,37 @@ def _extract_bw(
     bed_path: str,
     bin_stat: str,
     n_bins: int,
-    fill: float = 0.0,
+    fill_value: float = 0.0,
 ) -> np.ndarray:    
     with pybigtools.open(str(bw_path), "r") as bw:
         lines = open(bed_path).read().splitlines()
         n = len(lines)
-        arr = np.full((n, n_bins), fill, dtype="float32")
+        arr = np.full((n, n_bins), fill_value, dtype="float32")
         for i, (c, s, e) in enumerate((l.split("\t") for l in lines)):
             try:
-                vals = bw.values(c, int(s), int(e), missing=fill,
+                vals = bw.values(c, int(s), int(e), missing=fill_value,
                                  exact=False, bins=n_bins, summary=bin_stat)
                 arr[i] = vals
             except KeyError:
                 pass
         return arr.astype("float32")
 
-# ——————————————————————————————————————————————————————————
-# public API #1: create brand-new GRAnData from a peaks-DF
-# ——————————————————————————————————————————————————————————
-
 def grandata_from_bigwigs(
     region_table: pd.DataFrame,
     bigwig_dir: Path|str,
     backed_path: Path|str,
+    target_region_width: int,
     *,
     array_name: str = 'X',
     obs_dim: str = 'obs',
     var_dim: str = 'var',
     seq_dim: str = 'seq_bins',
-    target_region_width: int,
     bin_stat: str = "mean",
     chunk_size: int = 512,
     n_bins: int = 1,
     backend: str = "zarr",
     tile_size: int = 5000,
+    fill_value: float = 0.
 ) -> GRAnData:
     """
     Create a new GRAnData from region_table and a folder of BigWigs.
@@ -109,7 +107,6 @@ def grandata_from_bigwigs(
     var_idx = peaks.region.values
 
     extra = {}
-    # *** note: we use the SAME pattern “<dim>-_-index” for both obs & var ***
     extra[f"{obs_dim}-_-index"] = xr.DataArray(obs_idx, dims=[obs_dim])
     extra[f"{var_dim}-_-index"] = xr.DataArray(var_idx, dims=[var_dim])
 
@@ -122,6 +119,12 @@ def grandata_from_bigwigs(
 
     adata = GRAnData(**extra)
     adata.attrs['chunk_size'] = chunk_size
+    adata.attrs['target_region_width'] = target_region_width
+    adata.attrs['bin_stat'] = bin_stat
+    adata.attrs['n_bins'] = n_bins
+    adata.attrs['obs_dim'] = obs_dim
+    adata.attrs['var_dim'] = var_dim
+    adata.attrs['seq_dim'] = seq_dim
 
     # 4) initialize the on‐disk store
     if backend == "icechunk":
@@ -145,6 +148,7 @@ def grandata_from_bigwigs(
         n_bins=n_bins,
         backend=backend,
         tile_size=tile_size,
+        fill_value=fill_value
     )
 
 # ——————————————————————————————————————————————————————————
@@ -173,12 +177,19 @@ def add_bigwig_array(
         bigwig_dir = list(Path(bigwig_dir).iterdir())
     bw_files = sorted(Path(p) for p in bigwig_dir)
 
-    n_obs = len(bw_files)
+    n_obs = len(adata[f"{obs_dim}-_-index"].values)#len(bw_files)
     n_var = len(region_table)
 
+    obs_names = adata[f"{obs_dim}-_-index"].values.astype(str).tolist()
+    # if your obs‐index was created from p.stem.replace('.','_'), do the same here
+    file_map = {
+        p.stem.replace('.', '_'): p
+        for p in bw_files
+    }
+    
     # 1) determine seq_len from first file
     tmp0 = _make_temp_bed(region_table, target_region_width)
-    sample = _extract_bw(bw_files[0], tmp0, bin_stat, n_bins,fill=fill_value)
+    sample = _extract_bw(bw_files[0], tmp0, bin_stat, n_bins,fill_value=fill_value)
     os.remove(tmp0)
     if sample.ndim == 1:
         sample = sample.reshape(n_var, 1)
@@ -230,13 +241,22 @@ def add_bigwig_array(
         tile = region_table.iloc[v0:v1]
         tmpb = _make_temp_bed(tile, target_region_width)
 
-        block = []
-        for bw in bw_files:
-            out = _extract_bw(bw, tmpb, bin_stat, n_bins, fill=fill_value)
+        # allocate full block, fill with NaNs
+        block = np.full(
+            (n_obs, v1 - v0, seq_len),
+            fill_value,
+            dtype="float32"
+        )
+        # for each obs slot, see if we have a matching bigwig
+        for i, name in enumerate(obs_names):
+            bw_path = file_map.get(name)
+            if bw_path is None:
+                # no file for this obs → leave as fill_value
+                continue
+            out = _extract_bw(bw_path, tmpb, bin_stat, n_bins, fill_value=fill_value)
             if out.ndim == 1:
                 out = out.reshape((v1 - v0, seq_len))
-            block.append(out)
-        block = np.stack(block, axis=0).astype("float32")
+            block[i, :, :] = out
 
         arr[:, v0:v1, :] = block
         os.remove(tmpb)

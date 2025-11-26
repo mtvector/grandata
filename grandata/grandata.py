@@ -11,6 +11,7 @@ try:
     import sparse  # for sparse multidimensional arrays
 except ImportError:
     print("no sparse")
+    # consider backed sparse: https://github.com/scverse/anndata/blob/main/src/anndata/_core/sparse_dataset.py
     sparse = None
 
 class GRAnData(xr.Dataset):

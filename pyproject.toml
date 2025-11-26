@@ -19,8 +19,13 @@ pybigtools  = ">=0.2.4"
 pandas      = "*"
 numpy       = "*"
 tqdm        = "*"
-ete3        = "*"
+loguru      = "*"
+pysam       = "*"
 pyfaidx     = "*"
+h5py        = "*"
+sparse      = "*"
+scipy       = "*"
+torchdata   = ">=0.11"
 torch       = { version = "^2.7", source = "pytorch-cpu", markers = "extra=='cpu' and extra!='cuda'" }
 
 

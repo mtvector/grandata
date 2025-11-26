@@ -1,9 +1,8 @@
-# grandata
-
-<div align="center">
+[<div align="center">
   <img src="assets/grandata_icon.png" alt="grandata logo!" width="200">
-</div>
+</div>](#)
 
+# grandata
 
 A *lightweight* python library for efficiently organizing and dataloading multimodal genomics data from multiple datasets (e.g. species) simultaneously. 
 
