@@ -1,5 +1,5 @@
 <div align="center">
-  [<img src="assets/grandata_icon.png" alt="grandata logo!" width="200">](#)
+  <img src="assets/grandata_icon.png" alt="grandata logo!" width="200">
 </div>
 
 # grandata
