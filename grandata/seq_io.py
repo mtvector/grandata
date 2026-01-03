@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 import json
+import zarr
 from tqdm import tqdm
 
 # Create a hot encoding table for DNA nucleotides (A, C, G, T)
@@ -101,7 +102,16 @@ def create_one_hot_encoded_array(
     da = xr.DataArray(encoded_array)
     return da
 
-def add_genome_sequences_to_grandata(adata: xr.Dataset, ranges_df: pd.DataFrame, genome, key: str = "sequences",dimnames = ('var','seq_len','nuc',), seq_length: int = None) -> xr.Dataset:
+def add_genome_sequences_to_grandata(
+    adata: xr.Dataset,
+    ranges_df: pd.DataFrame,
+    genome,
+    key: str = "sequences",
+    dimnames = ('var','seq_len','nuc',),
+    seq_length: int = None,
+    backed: bool = True,
+    batch_size: int | None = None,
+) -> xr.Dataset:
     """
     Create a one-hot encoded array of genomic sequences using the provided genome and ranges,
     add it to the GRAnData (an xarray.Dataset) under the specified key (default 'sequences'),
@@ -120,13 +130,60 @@ def add_genome_sequences_to_grandata(adata: xr.Dataset, ranges_df: pd.DataFrame,
     seq_length : int, optional
         The sequence length to fetch. If None, it is inferred from ranges_df.
     dimnames: list or tuple of length 3 naming your var, and sequence length and nucleotide dimensions.
+    backed: If True and adata has a backing store, stream sequences to zarr without loading all into memory.
+    batch_size: Number of regions to process per batch when streaming.
     
     Returns
     -------
     xr.Dataset
         Updated GRAnData object with the one-hot encoded array added as a data variable and genome metadata stored in attrs.
     """
-    # Create the one-hot encoded DataArray.
+    if seq_length is None:
+        seq_length = int(ranges_df.iloc[0]['end']) - int(ranges_df.iloc[0]['start'])
+    if batch_size is None:
+        batch_size = adata.attrs.get('chunk_size', 128)
+
+    if backed and "source" in getattr(adata, "encoding", {}):
+        path = adata.encoding["source"]
+        store = zarr.open(path, mode="a")
+        if key not in store:
+            arr = store.create_dataset(
+                key,
+                shape=(ranges_df.shape[0], seq_length, 4),
+                chunks=(batch_size, seq_length, 4),
+                dtype="uint8",
+                fill_value=0,
+            )
+            arr.attrs["_ARRAY_DIMENSIONS"] = list(dimnames)
+        else:
+            arr = store[key]
+
+        n_var = ranges_df.shape[0]
+        for v0 in tqdm(range(0, n_var, batch_size), total=(n_var + batch_size - 1) // batch_size):
+            v1 = min(v0 + batch_size, n_var)
+            batch = ranges_df.iloc[v0:v1]
+            encoded = np.empty((v1 - v0, seq_length, 4), dtype=np.uint8)
+            for i, (_, row) in enumerate(batch.iterrows()):
+                chrom = row['chrom']
+                start = int(row['start'])
+                end = int(row['end'])
+                strand = row.get('strand', '+') if 'strand' in row else '+'
+                seq = genome.fetch(chrom, start, end, strand=strand)
+                if len(seq) < seq_length:
+                    seq = seq.ljust(seq_length, 'N')
+                elif len(seq) > seq_length:
+                    seq = seq[:seq_length]
+                encoded[i] = one_hot_encode_sequence(seq)
+            arr[v0:v1, :, :] = encoded
+
+        store.attrs["genome_name"] = genome.name
+        store.attrs["genome_fasta"] = str(genome._fasta) if hasattr(genome, "_fasta") else None
+        store.attrs["genome_chrom_sizes"] = json.dumps(genome.chrom_sizes) if len(genome.chrom_sizes.keys())<1000 else None
+        if hasattr(adata.__class__, "open_zarr"):
+            return adata.__class__.open_zarr(path)
+        return xr.open_zarr(path)
+
+    # Create the one-hot encoded DataArray in memory (small datasets).
     da = create_one_hot_encoded_array(ranges_df, genome, seq_length=seq_length)
     da = da.rename(dict(zip(da.dims,dimnames)))
     adata[key] = da.chunk({dimnames[0]:adata.attrs['chunk_size'],dimnames[1]:seq_length,dimnames[2]:4})

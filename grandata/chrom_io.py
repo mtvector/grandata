@@ -36,16 +36,21 @@ def _make_temp_bed(peaks: pd.DataFrame, width: int) -> str:
 
 def _extract_bw(
     bw_path: Path,
-    bed_path: str,
+    bed_path: str | None,
     bin_stat: str,
     n_bins: int,
     fill_value: float = 0.0,
-) -> np.ndarray:    
+    intervals: list[tuple[str, int, int]] | None = None,
+) -> np.ndarray:
     with pybigtools.open(str(bw_path), "r") as bw:
-        lines = open(bed_path).read().splitlines()
-        n = len(lines)
+        if intervals is None:
+            if bed_path is None:
+                raise ValueError("bed_path or intervals must be provided.")
+            lines = open(bed_path).read().splitlines()
+            intervals = [(c, int(s), int(e)) for c, s, e in (l.split("\t") for l in lines)]
+        n = len(intervals)
         arr = np.full((n, n_bins), fill_value, dtype="float32")
-        for i, (c, s, e) in enumerate((l.split("\t") for l in lines)):
+        for i, (c, s, e) in enumerate(intervals):
             try:
                 vals = bw.values(c, int(s), int(e), missing=fill_value,
                                  exact=False, bins=n_bins, summary=bin_stat)
@@ -69,7 +74,9 @@ def grandata_from_bigwigs(
     n_bins: int = 1,
     backend: str = "zarr",
     tile_size: int = 5000,
-    fill_value: float = 0.
+    fill_value: float = 0.,
+    obs_chunk_size: int | None = None,
+    n_workers: int = 1,
 ) -> GRAnData:
     """
     Create a new GRAnData from region_table and a folder of BigWigs.
@@ -148,7 +155,9 @@ def grandata_from_bigwigs(
         n_bins=n_bins,
         backend=backend,
         tile_size=tile_size,
-        fill_value=fill_value
+        fill_value=fill_value,
+        obs_chunk_size=obs_chunk_size,
+        n_workers=n_workers,
     )
 
 # ——————————————————————————————————————————————————————————
@@ -171,6 +180,8 @@ def add_bigwig_array(
     backend: str = "zarr",
     tile_size: int = 5000,
     fill_value = np.nan,
+    obs_chunk_size: int | None = None,
+    n_workers: int = 1,
 ) -> GRAnData:
     # allow passing either a folder or pre-collected list
     if not isinstance(bigwig_dir, (list,tuple)):
@@ -187,39 +198,26 @@ def add_bigwig_array(
         for p in bw_files
     }
     
-    # 1) determine seq_len from first file
-    tmp0 = _make_temp_bed(region_table, target_region_width)
-    sample = _extract_bw(bw_files[0], tmp0, bin_stat, n_bins,fill_value=fill_value)
-    os.remove(tmp0)
-    if sample.ndim == 1:
-        sample = sample.reshape(n_var, 1)
-    seq_len = sample.shape[1]
-    
-    # 2) create empty DataArray and Zarr/Icechunk backing
-    da = xr.DataArray(
-        np.full((n_obs, n_var, seq_len), np.nan, dtype="float32"),
-        dims=[obs_dim, var_dim, seq_dim],
-        coords={
-            obs_dim: adata[f"{obs_dim}-_-index"].values,
-            var_dim: adata[f"{var_dim}-_-index"].values,
-            seq_dim: np.arange(seq_len),
-        }
-    ).chunk({obs_dim: n_obs, var_dim: chunk_size, seq_dim: seq_len})
+    # 1) determine seq_len directly
+    seq_len = n_bins
+    if obs_chunk_size is None:
+        obs_chunk_size = min(16, n_obs)
 
-    adata[array_name] = da
-
-    # open the store
+    # 2) create empty Zarr/Icechunk backing without allocating full array in RAM
     if backend=="icechunk":
         adata.session = adata.repo.writable_session("main")
         grp = zarr.open_group(adata.session.store, mode="a")
-        arr = grp.create(
-            name=array_name,
-            shape=(n_obs, n_var, seq_len),
-            chunks=(n_obs, chunk_size, seq_len),
-            dtype="float32",
-            fill_value=fill_value
-        )
-        arr.attrs["_ARRAY_DIMENSIONS"] = [obs_dim, var_dim, seq_dim]
+        if array_name not in grp:
+            arr = grp.create(
+                name=array_name,
+                shape=(n_obs, n_var, seq_len),
+                chunks=(obs_chunk_size, chunk_size, seq_len),
+                dtype="float32",
+                fill_value=fill_value
+            )
+            arr.attrs["_ARRAY_DIMENSIONS"] = [obs_dim, var_dim, seq_dim]
+        else:
+            arr = grp[array_name]
     else:
         path = adata.encoding["source"]
         adata.to_zarr(path, mode="a")
@@ -228,7 +226,7 @@ def add_bigwig_array(
             arr = store.create_dataset(
                 array_name,
                 shape=(n_obs, n_var, seq_len),
-                chunks=(n_obs, chunk_size, seq_len),
+                chunks=(obs_chunk_size, chunk_size, seq_len),
                 dtype="float32",
                 fill_value=fill_value
             )
@@ -241,24 +239,40 @@ def add_bigwig_array(
         tile = region_table.iloc[v0:v1]
         tmpb = _make_temp_bed(tile, target_region_width)
 
-        # allocate full block, fill with NaNs
-        block = np.full(
-            (n_obs, v1 - v0, seq_len),
-            fill_value,
-            dtype="float32"
-        )
+        with open(tmpb) as bed_f:
+            intervals = [(c, int(s), int(e)) for c, s, e in (l.split("\t") for l in bed_f)]
         # for each obs slot, see if we have a matching bigwig
-        for i, name in enumerate(obs_names):
-            bw_path = file_map.get(name)
-            if bw_path is None:
-                # no file for this obs → leave as fill_value
-                continue
-            out = _extract_bw(bw_path, tmpb, bin_stat, n_bins, fill_value=fill_value)
-            if out.ndim == 1:
-                out = out.reshape((v1 - v0, seq_len))
-            block[i, :, :] = out
-
-        arr[:, v0:v1, :] = block
+        if n_workers > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                futures = {}
+                for i, name in enumerate(obs_names):
+                    bw_path = file_map.get(name)
+                    if bw_path is None:
+                        continue
+                    futures[ex.submit(
+                        _extract_bw, bw_path, None, bin_stat, n_bins,
+                        fill_value=fill_value, intervals=intervals
+                    )] = i
+                for fut in as_completed(futures):
+                    i = futures[fut]
+                    out = fut.result()
+                    if out.ndim == 1:
+                        out = out.reshape((v1 - v0, seq_len))
+                    arr[i, v0:v1, :] = out
+        else:
+            for i, name in enumerate(obs_names):
+                bw_path = file_map.get(name)
+                if bw_path is None:
+                    # no file for this obs → leave as fill_value
+                    continue
+                out = _extract_bw(
+                    bw_path, None, bin_stat, n_bins,
+                    fill_value=fill_value, intervals=intervals
+                )
+                if out.ndim == 1:
+                    out = out.reshape((v1 - v0, seq_len))
+                arr[i, v0:v1, :] = out
         os.remove(tmpb)
 
         if backend=="icechunk":

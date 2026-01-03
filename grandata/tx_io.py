@@ -248,9 +248,9 @@ def read_h5ad_selective_to_grandata(
     return GRAnData(data_vars=data_vars, coords=coords)
 
 def write_tss_bigwigs(
-    matrix: np.ndarray,
-    var_names: list[str],
-    obs_names: list[str],
+    matrix: np.ndarray | xr.DataArray,
+    var_names: list[str] | None,
+    obs_names: list[str] | None,
     gtf_file: str,
     target_dir: str,
     gtf_gene_field: str = 'gene',
@@ -264,11 +264,12 @@ def write_tss_bigwigs(
 
     Parameters
     ----------
-    matrix : np.ndarray
-        Shape (n_obs, n_var), transcription values.
-    var_names : list[str]
+    matrix : np.ndarray | xr.DataArray
+        Shape (n_obs, n_var), transcription values. If DataArray, obs/var names
+        can be inferred from its coords.
+    var_names : list[str] | None
         Names of genes, in the same order as matrix columns.
-    obs_names : list[str]
+    obs_names : list[str] | None
         Names for each observation (e.g. clusters, pseudobulk sets).
     gtf_file : str
         Path to a gene annotation GTF.
@@ -283,6 +284,17 @@ def write_tss_bigwigs(
     """
     target_dir = Path(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
+
+    obs_dim = None
+    var_dim = None
+    if isinstance(matrix, xr.DataArray):
+        obs_dim, var_dim = matrix.dims[:2]
+        if obs_names is None:
+            obs_names = matrix.coords[obs_dim].astype(str).tolist()
+        if var_names is None:
+            var_names = matrix.coords[var_dim].astype(str).tolist()
+    if obs_names is None or var_names is None:
+        raise ValueError("obs_names and var_names must be provided for ndarray inputs.")
     
     # --- Load GTF and restrict to gene-level features ---
     gtf = read_gtf(gtf_file)
@@ -333,7 +345,12 @@ def write_tss_bigwigs(
 
         # 1) Build the raw interval list: (chrom, start, end, signed_value)
         raw_intervals: list[tuple[str, int, int, float]] = []
-        for i, value in tqdm(list(enumerate(matrix[obs_idx])), desc=f"Building intervals for {obs_name}", leave=False):
+        if isinstance(matrix, xr.DataArray):
+            row = matrix.isel({obs_dim: obs_idx}).data
+            row_vals = np.asarray(row).ravel()
+        else:
+            row_vals = matrix[obs_idx]
+        for i, value in tqdm(list(enumerate(row_vals)), desc=f"Building intervals for {obs_name}", leave=False):
             chrom = chroms[i]
             tss = tss_list[i]
             strand = strands[i]
@@ -407,6 +424,7 @@ def group_aggr_xr(
     categories: Union[str, List[str]],
     agg_func=np.mean,
     normalize: bool = False,
+    materialize: bool = True,
 ) -> xr.DataArray:
     """
     Group–aggregate an xarray.Dataset along 'obs' by one or more categorical
@@ -427,6 +445,8 @@ def group_aggr_xr(
         Aggregation function (e.g. np.mean, np.median, np.std).
     normalize
         If True, each observation is normalized by its row-sum before grouping.
+    materialize
+        If False, return the grouped DataArray without densifying or reshaping.
 
     Returns
     -------
@@ -485,6 +505,8 @@ def group_aggr_xr(
 
     # — groupby & reduce over obs_dim —
     grouped = da.groupby(group_key).reduce(agg_func, dim=obs_dim)
+    if not materialize:
+        return grouped
 
     # — pull out the raw numpy array, densify if sparse-backed —
     raw = grouped.data
@@ -528,4 +550,3 @@ def group_aggr_xr(
 
     # — construct and return the aggregated DataArray —
     return xr.DataArray(data=result, dims=dims, coords=coords)
-
