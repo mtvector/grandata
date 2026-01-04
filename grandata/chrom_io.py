@@ -1,16 +1,11 @@
 """chrom_io.py – Creating AnnDataModule from bigwigs."""
 
 from __future__ import annotations
-import os
-import tempfile
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import pybigtools
-from tqdm import tqdm
 import xarray as xr
-import zarr
-import re
 
 from .grandata import GRAnData
 from collections import defaultdict
@@ -22,42 +17,6 @@ except:
 # ——————————————————————————————————————————————————————————
 # low-level utilities
 # ——————————————————————————————————————————————————————————
-
-def _make_temp_bed(peaks: pd.DataFrame, width: int) -> str:
-    # assume peaks has 'chrom','start','end'
-    tmp = tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".bed")
-    half = (width - (peaks.end - peaks.start)) // 2
-    starts = (peaks.start - half).clip(lower=0)
-    ends   = starts + width
-    for c,s,e in zip(peaks.chrom, starts, ends):
-        tmp.write(f"{c}\t{int(s)}\t{int(e)}\n")
-    tmp.close()
-    return tmp.name
-
-def _extract_bw(
-    bw_path: Path,
-    bed_path: str | None,
-    bin_stat: str,
-    n_bins: int,
-    fill_value: float = 0.0,
-    intervals: list[tuple[str, int, int]] | None = None,
-) -> np.ndarray:
-    with pybigtools.open(str(bw_path), "r") as bw:
-        if intervals is None:
-            if bed_path is None:
-                raise ValueError("bed_path or intervals must be provided.")
-            lines = open(bed_path).read().splitlines()
-            intervals = [(c, int(s), int(e)) for c, s, e in (l.split("\t") for l in lines)]
-        n = len(intervals)
-        arr = np.full((n, n_bins), fill_value, dtype="float32")
-        for i, (c, s, e) in enumerate(intervals):
-            try:
-                vals = bw.values(c, int(s), int(e), missing=fill_value,
-                                 exact=False, bins=n_bins, summary=bin_stat)
-                arr[i] = vals
-            except KeyError:
-                pass
-        return arr.astype("float32")
 
 def grandata_from_bigwigs(
     region_table: pd.DataFrame,
@@ -82,7 +41,14 @@ def grandata_from_bigwigs(
     Create a new GRAnData from region_table and a folder of BigWigs.
     The resulting store is written to `backed_path`, and a first array
     named `array_name` is streamed in along dims (obs_dim, var_dim, seq_dim).
+
+    Note: this uses a dask-first pipeline; `backend` must be "zarr".
+    The parameters `tile_size` and `n_workers` are retained for compatibility
+    but are ignored.
     """
+    if backend != "zarr":
+        raise ValueError("Only backend='zarr' is supported for grandata_from_bigwigs.")
+
     bigwig_dir = Path(bigwig_dir)
 
     # 1) scan BigWigs and collect chromosomes
@@ -134,14 +100,11 @@ def grandata_from_bigwigs(
     adata.attrs['seq_dim'] = seq_dim
 
     # 4) initialize the on‐disk store
-    if backend == "icechunk":
-        adata.to_icechunk(str(backed_path), mode="w")
-    else:
-        adata.to_zarr(str(backed_path), mode="w")
-        adata = GRAnData.open_zarr(str(backed_path))
+    adata.to_zarr(str(backed_path), mode="w")
+    adata = GRAnData.open_zarr(str(backed_path), consolidated=False)
 
     # 5) stream in the very first array
-    return add_bigwig_array(
+    return add_bigwig_array_dask(
         adata,
         region_table=peaks,
         bigwig_dir=bw_files,
@@ -153,12 +116,167 @@ def grandata_from_bigwigs(
         target_region_width=target_region_width,
         chunk_size=chunk_size,
         n_bins=n_bins,
-        backend=backend,
-        tile_size=tile_size,
         fill_value=fill_value,
         obs_chunk_size=obs_chunk_size,
-        n_workers=n_workers,
     )
+
+
+def grandata_from_bigwigs_dask(
+    region_table: pd.DataFrame,
+    bigwig_dir: Path | str,
+    backed_path: Path | str,
+    target_region_width: int,
+    *,
+    array_name: str = "X",
+    obs_dim: str = "obs",
+    var_dim: str = "var",
+    seq_dim: str = "seq_bins",
+    bin_stat: str = "mean",
+    chunk_size: int = 512,
+    n_bins: int = 1,
+    fill_value: float = 0.0,
+    obs_chunk_size: int | None = None,
+) -> GRAnData:
+    """
+    Dask-first version of grandata_from_bigwigs.
+
+    Builds a lazy dask array for the BigWig extraction and writes via xarray.to_zarr.
+    Avoids manual zarr writes and uses stable xarray/dask APIs.
+    """
+    try:
+        import dask.array as da
+    except ImportError as exc:
+        raise ImportError("grandata_from_bigwigs_dask requires dask.") from exc
+
+    bigwig_dir = Path(bigwig_dir)
+    bw_files = []
+    chroms = set()
+    for p in bigwig_dir.iterdir():
+        try:
+            with pybigtools.open(str(p), "r") as bw:
+                chroms |= set(bw.chroms().keys())
+            bw_files.append(p)
+        except Exception:
+            continue
+    if not bw_files:
+        raise FileNotFoundError(f"No BigWigs in {bigwig_dir!r}")
+    bw_files.sort()
+
+    peaks = region_table.query("chrom in @chroms").reset_index(drop=True)
+    peaks["region"] = (
+        peaks.chrom.astype(str)
+        + ":"
+        + peaks.start.astype(int).astype(str)
+        + "-"
+        + peaks.end.astype(int).astype(str)
+    )
+
+    obs_idx = [p.stem.replace(".", "_") for p in bw_files]
+    var_idx = peaks.region.values
+
+    extra = {}
+    extra[f"{obs_dim}-_-index"] = xr.DataArray(obs_idx, dims=[obs_dim])
+    extra[f"{var_dim}-_-index"] = xr.DataArray(var_idx, dims=[var_dim])
+    for col in ("chrom", "start", "end", "region"):
+        extra[f"{var_dim}-_-{col}"] = (
+            xr.DataArray(peaks[col].values, dims=[var_dim]).chunk({var_dim: chunk_size})
+        )
+
+    adata = GRAnData(**extra)
+    adata.attrs["chunk_size"] = chunk_size
+    adata.attrs["target_region_width"] = target_region_width
+    adata.attrs["bin_stat"] = bin_stat
+    adata.attrs["n_bins"] = n_bins
+    adata.attrs["obs_dim"] = obs_dim
+    adata.attrs["var_dim"] = var_dim
+    adata.attrs["seq_dim"] = seq_dim
+
+    if obs_chunk_size is None:
+        obs_chunk_size = min(16, len(obs_idx))
+
+    widths = peaks.end - peaks.start
+    half = (target_region_width - widths) // 2
+    starts = (peaks.start - half).clip(lower=0)
+    ends = starts + target_region_width
+    intervals = list(
+        zip(peaks.chrom.astype(str), starts.astype(int), ends.astype(int))
+    )
+
+    n_obs = len(obs_idx)
+    n_var = len(var_idx)
+
+    def _load_block(_block, block_info=None):
+        info = block_info[0]["array-location"]
+        obs_loc = info[0]
+        var_loc = info[1]
+        obs_slice = obs_loc if isinstance(obs_loc, slice) else slice(obs_loc[0], obs_loc[1])
+        var_slice = var_loc if isinstance(var_loc, slice) else slice(var_loc[0], var_loc[1])
+        return _extract_bw_chunk(
+            bw_files=bw_files,
+            intervals=intervals,
+            obs_slice=obs_slice,
+            var_slice=var_slice,
+            n_bins=n_bins,
+            bin_stat=bin_stat,
+            fill_value=fill_value,
+        )
+
+    template = da.zeros(
+        (n_obs, n_var, n_bins),
+        chunks=(obs_chunk_size, chunk_size, n_bins),
+        dtype="float32",
+    )
+    data = da.map_blocks(_load_block, template, dtype="float32")
+
+    adata[array_name] = xr.DataArray(
+        data,
+        dims=(obs_dim, var_dim, seq_dim),
+        coords={
+            obs_dim: obs_idx,
+            var_dim: var_idx,
+            seq_dim: np.arange(n_bins),
+        },
+    )
+
+    adata.to_zarr(str(backed_path), mode="w")
+    return GRAnData.open_zarr(str(backed_path), consolidated=False)
+
+
+def _extract_bw_chunk(
+    *,
+    bw_files: list[Path | None],
+    intervals: list[tuple[str, int, int]],
+    obs_slice: slice,
+    var_slice: slice,
+    n_bins: int,
+    bin_stat: str,
+    fill_value: float,
+) -> np.ndarray:
+    obs_idx = np.arange(len(bw_files))[obs_slice]
+    var_idx = np.arange(len(intervals))[var_slice]
+    out = np.full((len(obs_idx), len(var_idx), n_bins), fill_value, dtype="float32")
+
+    for o_i, obs_i in enumerate(obs_idx):
+        bw_path = bw_files[obs_i]
+        if bw_path is None:
+            continue
+        with pybigtools.open(str(bw_path), "r") as bw:
+            for v_j, v_i in enumerate(var_idx):
+                c, s, e = intervals[v_i]
+                try:
+                    vals = bw.values(
+                        c,
+                        int(s),
+                        int(e),
+                        missing=fill_value,
+                        exact=False,
+                        bins=n_bins,
+                        summary=bin_stat,
+                    )
+                    out[o_i, v_j, :] = vals
+                except KeyError:
+                    continue
+    return out
 
 # ——————————————————————————————————————————————————————————
 # public API #2: append a new array from bigwigs into an existing GRAnData
@@ -183,115 +301,107 @@ def add_bigwig_array(
     obs_chunk_size: int | None = None,
     n_workers: int = 1,
 ) -> GRAnData:
-    # allow passing either a folder or pre-collected list
-    if not isinstance(bigwig_dir, (list,tuple)):
-        bigwig_dir = list(Path(bigwig_dir).iterdir())
-    bw_files = sorted(Path(p) for p in bigwig_dir)
+    """Compatibility wrapper around add_bigwig_array_dask (dask-first)."""
+    return add_bigwig_array_dask(
+        adata,
+        region_table=region_table,
+        bigwig_dir=bigwig_dir,
+        array_name=array_name,
+        obs_dim=obs_dim,
+        var_dim=var_dim,
+        seq_dim=seq_dim,
+        target_region_width=target_region_width,
+        bin_stat=bin_stat,
+        chunk_size=chunk_size,
+        n_bins=n_bins,
+        fill_value=fill_value,
+        obs_chunk_size=obs_chunk_size,
+    )
 
-    n_obs = len(adata[f"{obs_dim}-_-index"].values)#len(bw_files)
+
+def add_bigwig_array_dask(
+    adata: GRAnData,
+    region_table: pd.DataFrame,
+    bigwig_dir: Path | str | list[Path],
+    *,
+    array_name: str,
+    obs_dim: str,
+    var_dim: str,
+    seq_dim: str,
+    target_region_width: int,
+    bin_stat: str = "mean",
+    chunk_size: int = 512,
+    n_bins: int = 1,
+    fill_value: float = np.nan,
+    obs_chunk_size: int | None = None,
+) -> GRAnData:
+    try:
+        import dask.array as da
+    except ImportError as exc:
+        raise ImportError("add_bigwig_array_dask requires dask.") from exc
+
+    if "source" not in getattr(adata, "encoding", {}):
+        raise ValueError("add_bigwig_array_dask requires a zarr-backed GRAnData.")
+
+    if not isinstance(bigwig_dir, (list, tuple)):
+        bw_files = sorted(Path(p) for p in Path(bigwig_dir).iterdir())
+    else:
+        bw_files = sorted(Path(p) for p in bigwig_dir)
+
+    n_obs = len(adata[f"{obs_dim}-_-index"].values)
     n_var = len(region_table)
 
     obs_names = adata[f"{obs_dim}-_-index"].values.astype(str).tolist()
-    # if your obs‐index was created from p.stem.replace('.','_'), do the same here
-    file_map = {
-        p.stem.replace('.', '_'): p
-        for p in bw_files
-    }
-    
-    # 1) determine seq_len directly
-    seq_len = n_bins
+    file_map = {p.stem.replace(".", "_"): p for p in bw_files}
+    bw_paths = [file_map.get(name) for name in obs_names]
+
     if obs_chunk_size is None:
         obs_chunk_size = min(16, n_obs)
 
-    # 2) create empty Zarr/Icechunk backing without allocating full array in RAM
-    if backend=="icechunk":
-        adata.session = adata.repo.writable_session("main")
-        grp = zarr.open_group(adata.session.store, mode="a")
-        if array_name not in grp:
-            arr = grp.create(
-                name=array_name,
-                shape=(n_obs, n_var, seq_len),
-                chunks=(obs_chunk_size, chunk_size, seq_len),
-                dtype="float32",
-                fill_value=fill_value,
-                dimension_names=(obs_dim, var_dim, seq_dim),
-                attributes={"_ARRAY_DIMENSIONS": [obs_dim, var_dim, seq_dim]},
-            )
-            arr.attrs["_ARRAY_DIMENSIONS"] = [obs_dim, var_dim, seq_dim]
-        else:
-            arr = grp[array_name]
-    else:
-        path = adata.encoding["source"]
-        adata.to_zarr(path, mode="a")
-        store = zarr.open(path, mode="a")
-        if array_name not in store:
-            arr = store.create_dataset(
-                array_name,
-                shape=(n_obs, n_var, seq_len),
-                chunks=(obs_chunk_size, chunk_size, seq_len),
-                dtype="float32",
-                fill_value=fill_value,
-                dimension_names=(obs_dim, var_dim, seq_dim),
-                attributes={"_ARRAY_DIMENSIONS": [obs_dim, var_dim, seq_dim]},
-            )
-            arr.attrs["_ARRAY_DIMENSIONS"] = [obs_dim, var_dim, seq_dim]
-        else:
-            arr = store[array_name]
+    widths = region_table.end - region_table.start
+    half = (target_region_width - widths) // 2
+    starts = (region_table.start - half).clip(lower=0)
+    ends = starts + target_region_width
+    intervals = list(
+        zip(region_table.chrom.astype(str), starts.astype(int), ends.astype(int))
+    )
 
-    # 3) tile through var-dimension
-    for v0 in tqdm(range(0, n_var, tile_size), desc=f"writing {array_name}"):
-        v1 = min(v0 + tile_size, n_var)
-        tile = region_table.iloc[v0:v1]
-        tmpb = _make_temp_bed(tile, target_region_width)
+    def _load_block(_block, block_info=None):
+        info = block_info[0]["array-location"]
+        obs_loc = info[0]
+        var_loc = info[1]
+        obs_slice = obs_loc if isinstance(obs_loc, slice) else slice(obs_loc[0], obs_loc[1])
+        var_slice = var_loc if isinstance(var_loc, slice) else slice(var_loc[0], var_loc[1])
+        return _extract_bw_chunk(
+            bw_files=bw_paths,
+            intervals=intervals,
+            obs_slice=obs_slice,
+            var_slice=var_slice,
+            n_bins=n_bins,
+            bin_stat=bin_stat,
+            fill_value=fill_value,
+        )
 
-        with open(tmpb) as bed_f:
-            intervals = [(c, int(s), int(e)) for c, s, e in (l.split("\t") for l in bed_f)]
-        # for each obs slot, see if we have a matching bigwig
-        if n_workers > 1:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            with ThreadPoolExecutor(max_workers=n_workers) as ex:
-                futures = {}
-                for i, name in enumerate(obs_names):
-                    bw_path = file_map.get(name)
-                    if bw_path is None:
-                        continue
-                    futures[ex.submit(
-                        _extract_bw, bw_path, None, bin_stat, n_bins,
-                        fill_value=fill_value, intervals=intervals
-                    )] = i
-                for fut in as_completed(futures):
-                    i = futures[fut]
-                    out = fut.result()
-                    if out.ndim == 1:
-                        out = out.reshape((v1 - v0, seq_len))
-                    arr[i, v0:v1, :] = out
-        else:
-            for i, name in enumerate(obs_names):
-                bw_path = file_map.get(name)
-                if bw_path is None:
-                    # no file for this obs → leave as fill_value
-                    continue
-                out = _extract_bw(
-                    bw_path, None, bin_stat, n_bins,
-                    fill_value=fill_value, intervals=intervals
-                )
-                if out.ndim == 1:
-                    out = out.reshape((v1 - v0, seq_len))
-                arr[i, v0:v1, :] = out
-        os.remove(tmpb)
+    template = da.zeros(
+        (n_obs, n_var, n_bins),
+        chunks=(obs_chunk_size, chunk_size, n_bins),
+        dtype="float32",
+    )
+    data = da.map_blocks(_load_block, template, dtype="float32")
 
-        if backend=="icechunk":
-            # commit each tile (optional)
-            # adata.to_icechunk(mode="a", commit_name=f"{array_name}_{v0}_{v1}")
-            pass
-
-    if backend=="icechunk":
-        adata.session = adata.repo.readonly_session("main")
-    else:
-        # reopen to refresh xarray coords / dims
-        adata = GRAnData.open_zarr(path, consolidated=False)
-
-    return adata
+    adata[array_name] = xr.DataArray(
+        data,
+        dims=(obs_dim, var_dim, seq_dim),
+        coords={
+            obs_dim: adata[f"{obs_dim}-_-index"].values,
+            var_dim: adata[f"{var_dim}-_-index"].values
+            if f"{var_dim}-_-index" in adata
+            else np.arange(n_var),
+            seq_dim: np.arange(n_bins),
+        },
+    )
+    adata.to_zarr(adata.encoding["source"], mode="a")
+    return GRAnData.open_zarr(adata.encoding["source"], consolidated=False)
 
 # -----------------------
 # Additional utility functions
