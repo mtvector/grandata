@@ -29,6 +29,11 @@ def get_hot_encoding_table(
     return table
 
 HOT_ENCODING_TABLE = get_hot_encoding_table()
+HOT_DECODING_TABLE = np.array([ord("N")] * 16, dtype=np.uint8)
+HOT_DECODING_TABLE[1] = ord("A")
+HOT_DECODING_TABLE[2] = ord("C")
+HOT_DECODING_TABLE[4] = ord("G")
+HOT_DECODING_TABLE[8] = ord("T")
 
 
 def one_hot_encode_sequence(sequence: str) -> np.ndarray:
@@ -153,6 +158,8 @@ def add_genome_sequences_to_grandata(
                 chunks=(batch_size, seq_length, 4),
                 dtype="uint8",
                 fill_value=0,
+                dimension_names=dimnames,
+                attributes={"_ARRAY_DIMENSIONS": list(dimnames)},
             )
             arr.attrs["_ARRAY_DIMENSIONS"] = list(dimnames)
         else:
@@ -180,8 +187,8 @@ def add_genome_sequences_to_grandata(
         store.attrs["genome_fasta"] = str(genome._fasta) if hasattr(genome, "_fasta") else None
         store.attrs["genome_chrom_sizes"] = json.dumps(genome.chrom_sizes) if len(genome.chrom_sizes.keys())<1000 else None
         if hasattr(adata.__class__, "open_zarr"):
-            return adata.__class__.open_zarr(path)
-        return xr.open_zarr(path)
+            return adata.__class__.open_zarr(path, consolidated=False)
+        return xr.open_zarr(path, consolidated=False)
 
     # Create the one-hot encoded DataArray in memory (small datasets).
     da = create_one_hot_encoded_array(ranges_df, genome, seq_length=seq_length)

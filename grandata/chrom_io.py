@@ -213,7 +213,9 @@ def add_bigwig_array(
                 shape=(n_obs, n_var, seq_len),
                 chunks=(obs_chunk_size, chunk_size, seq_len),
                 dtype="float32",
-                fill_value=fill_value
+                fill_value=fill_value,
+                dimension_names=(obs_dim, var_dim, seq_dim),
+                attributes={"_ARRAY_DIMENSIONS": [obs_dim, var_dim, seq_dim]},
             )
             arr.attrs["_ARRAY_DIMENSIONS"] = [obs_dim, var_dim, seq_dim]
         else:
@@ -228,8 +230,11 @@ def add_bigwig_array(
                 shape=(n_obs, n_var, seq_len),
                 chunks=(obs_chunk_size, chunk_size, seq_len),
                 dtype="float32",
-                fill_value=fill_value
+                fill_value=fill_value,
+                dimension_names=(obs_dim, var_dim, seq_dim),
+                attributes={"_ARRAY_DIMENSIONS": [obs_dim, var_dim, seq_dim]},
             )
+            arr.attrs["_ARRAY_DIMENSIONS"] = [obs_dim, var_dim, seq_dim]
         else:
             arr = store[array_name]
 
@@ -284,7 +289,7 @@ def add_bigwig_array(
         adata.session = adata.repo.readonly_session("main")
     else:
         # reopen to refresh xarray coords / dims
-        adata = GRAnData.open_zarr(path)
+        adata = GRAnData.open_zarr(path, consolidated=False)
 
     return adata
 
