@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pybigtools
 import xarray as xr
+from tqdm import tqdm
 
 from .grandata import GRAnData
 from collections import defaultdict
@@ -54,7 +55,7 @@ def grandata_from_bigwigs(
     # 1) scan BigWigs and collect chromosomes
     bw_files = []
     chroms = set()
-    for p in bigwig_dir.iterdir():
+    for p in tqdm(list(bigwig_dir.iterdir()), desc="Scanning BigWigs"):
         try:
             with pybigtools.open(str(p), "r") as bw:
                 chroms |= set(bw.chroms().keys())
@@ -100,7 +101,15 @@ def grandata_from_bigwigs(
     adata.attrs['seq_dim'] = seq_dim
 
     # 4) initialize the on‐disk store
-    adata.to_zarr(str(backed_path), mode="w")
+    try:
+        from dask.diagnostics import ProgressBar
+    except Exception:
+        ProgressBar = None
+    if ProgressBar is None:
+        adata.to_zarr(str(backed_path), mode="w")
+    else:
+        with ProgressBar():
+            adata.to_zarr(str(backed_path), mode="w")
     adata = GRAnData.open_zarr(str(backed_path), consolidated=False)
 
     # 5) stream in the very first array
@@ -151,7 +160,7 @@ def grandata_from_bigwigs_dask(
     bigwig_dir = Path(bigwig_dir)
     bw_files = []
     chroms = set()
-    for p in bigwig_dir.iterdir():
+    for p in tqdm(list(bigwig_dir.iterdir()), desc="Scanning BigWigs"):
         try:
             with pybigtools.open(str(p), "r") as bw:
                 chroms |= set(bw.chroms().keys())
@@ -238,7 +247,15 @@ def grandata_from_bigwigs_dask(
         },
     )
 
-    adata.to_zarr(str(backed_path), mode="w")
+    try:
+        from dask.diagnostics import ProgressBar
+    except Exception:
+        ProgressBar = None
+    if ProgressBar is None:
+        adata.to_zarr(str(backed_path), mode="w")
+    else:
+        with ProgressBar():
+            adata.to_zarr(str(backed_path), mode="w")
     return GRAnData.open_zarr(str(backed_path), consolidated=False)
 
 
@@ -389,18 +406,64 @@ def add_bigwig_array_dask(
     )
     data = da.map_blocks(_load_block, template, dtype="float32")
 
-    adata[array_name] = xr.DataArray(
+    obs_labels = adata[f"{obs_dim}-_-index"].values.astype(str)
+    if f"{var_dim}-_-index" in adata:
+        var_labels = adata[f"{var_dim}-_-index"].values.astype(str)
+    else:
+        var_labels = np.arange(n_var)
+
+    da_out = xr.DataArray(
         data,
         dims=(obs_dim, var_dim, seq_dim),
         coords={
-            obs_dim: adata[f"{obs_dim}-_-index"].values,
-            var_dim: adata[f"{var_dim}-_-index"].values
-            if f"{var_dim}-_-index" in adata
-            else np.arange(n_var),
+            obs_dim: obs_labels,
+            var_dim: var_labels,
             seq_dim: np.arange(n_bins),
         },
     )
-    adata.to_zarr(adata.encoding["source"], mode="a")
+
+    # Align to the existing store dims to avoid size-mismatch errors when adata is a subset.
+    store_ds = xr.open_zarr(adata.encoding["source"], consolidated=False)
+    if f"{obs_dim}-_-index" in store_ds:
+        store_obs = store_ds[f"{obs_dim}-_-index"].values.astype(str)
+    elif obs_dim in store_ds.coords:
+        store_obs = store_ds.coords[obs_dim].values
+    else:
+        store_obs = np.arange(store_ds.sizes.get(obs_dim, len(obs_labels)))
+
+    if f"{var_dim}-_-index" in store_ds:
+        store_var = store_ds[f"{var_dim}-_-index"].values.astype(str)
+    elif var_dim in store_ds.coords:
+        store_var = store_ds.coords[var_dim].values
+    else:
+        store_var = np.arange(store_ds.sizes.get(var_dim, n_var))
+
+    if len(store_obs) != len(obs_labels) or len(store_var) != len(var_labels):
+        da_out = da_out.reindex(
+            {obs_dim: store_obs, var_dim: store_var},
+            fill_value=fill_value,
+        )
+
+    # Ensure uniform chunks after reindexing to satisfy zarr chunk constraints.
+    if obs_chunk_size is None:
+        obs_chunk_size = min(16, len(store_obs))
+    da_out = da_out.chunk(
+        {
+            obs_dim: obs_chunk_size,
+            var_dim: chunk_size,
+            seq_dim: n_bins,
+        }
+    )
+
+    try:
+        from dask.diagnostics import ProgressBar
+    except Exception:
+        ProgressBar = None
+    if ProgressBar is None:
+        xr.Dataset({array_name: da_out}).to_zarr(adata.encoding["source"], mode="a")
+    else:
+        with ProgressBar():
+            xr.Dataset({array_name: da_out}).to_zarr(adata.encoding["source"], mode="a")
     return GRAnData.open_zarr(adata.encoding["source"], consolidated=False)
 
 # -----------------------

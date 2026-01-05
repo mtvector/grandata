@@ -195,7 +195,15 @@ def add_genome_sequences_to_grandata(
         adata.attrs["genome_name"] = genome.name
         adata.attrs["genome_fasta"] = fasta_path
         adata.attrs["genome_chrom_sizes"] = json.dumps(genome.chrom_sizes) if len(genome.chrom_sizes.keys()) < 1000 else None
-        adata.to_zarr(adata.encoding["source"], mode="a")
+        try:
+            from dask.diagnostics import ProgressBar
+        except Exception:
+            ProgressBar = None
+        if ProgressBar is None:
+            adata.to_zarr(adata.encoding["source"], mode="a")
+        else:
+            with ProgressBar():
+                adata.to_zarr(adata.encoding["source"], mode="a")
         if hasattr(adata.__class__, "open_zarr"):
             return adata.__class__.open_zarr(adata.encoding["source"], consolidated=False)
         return xr.open_zarr(adata.encoding["source"], consolidated=False)
