@@ -117,24 +117,26 @@ def bench_loader(args):
 
     adatas = [grandata.GRAnData.open_zarr(p, consolidated=False) for p in args.zarr]
 
-    dnatransform = None
+    transforms = {}
     if args.dna_window is not None:
         dnatransform = grandata.seq_io.DNATransform(
             out_len=args.dna_window,
             random_rc=args.random_rc,
             max_shift=args.max_shift,
+            apply_states=("train", "val"),
         )
+        seq_out_keys = [load_keys.get(name, name) for name in sequence_vars]
+        for key in seq_out_keys:
+            transforms.setdefault(key, []).append(dnatransform)
 
     module = grandata.GRAnDataModule(
         adatas=adatas,
         batch_size=args.batch_size,
         load_keys=load_keys,
-        dnatransform=dnatransform,
+        transforms=transforms,
         shuffle_dims=shuffle_dims,
         split=args.split,
         batch_dim=args.batch_dim,
-        sequence_vars=sequence_vars,
-        num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         pin_memory=args.pin_memory if args.pin_memory else None,
     )
@@ -227,7 +229,6 @@ def main():
     loader.add_argument("--dna-window", type=int)
     loader.add_argument("--random-rc", action="store_true")
     loader.add_argument("--max-shift", type=int)
-    loader.add_argument("--num-workers", type=int, default=0)
     loader.add_argument("--prefetch-factor", type=int, default=2)
     loader.add_argument("--pin-memory", default="")
     loader.add_argument("--n-batches", type=int, default=100)

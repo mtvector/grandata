@@ -4,8 +4,6 @@ import numpy as np
 import os
 import json
 import zarr
-import icechunk as ic
-from icechunk.xarray import to_icechunk
 
 try:
     import sparse  # for sparse multidimensional arrays
@@ -15,12 +13,11 @@ except ImportError:
     sparse = None
 
 class GRAnData(xr.Dataset):
-    __slots__ = ("__dict__","session","repo")  # remove always_convert_df from slots
+    __slots__ = ("__dict__",)  # remove always_convert_df from slots
 
     def __init__(self, 
                  data_vars=None,
                  coords=None,
-                 session=None,
                  **kwargs):
         """
         Create a GRAnData object as a thin wrapper of xarray.Dataset.
@@ -28,8 +25,6 @@ class GRAnData(xr.Dataset):
         grouped into dataframe (the separator is -_- ...idk).
         Also automatically stores and reloads sparse arrays.
         """
-        self.session = None
-        self.repo = None
         if data_vars is None:
             data_vars = {}
         # Merge any additional kwargs.
@@ -160,53 +155,6 @@ class GRAnData(xr.Dataset):
         
     #Use Xarray DataSet's built in to_zarr
 
-    @classmethod
-    def open_icechunk(cls, store, cache_config={'num_bytes_chunks':int(1e9)}, **kwargs):
-        '''store must be either path to zarr store or icechunk repo'''
-        if isinstance(store, (str, os.PathLike)):
-            store_path = store
-            storage_config = ic.local_filesystem_storage(store_path)
-            config = ic.RepositoryConfig.default()
-            config.caching = ic.CachingConfig(**cache_config)
-            if not ic.Repository.exists(storage_config):
-                repo = ic.Repository.create(storage_config,config)
-            else:
-                repo = ic.Repository.open(storage_config, config)
-        else:
-            repo = store
-        session = repo.readonly_session("main")
-            # store_path = session.store.attrs["source"] #TODO test this = it doesn't work
-        ds = xr.open_zarr(session.store, consolidated=False, **kwargs)
-        # Save the store path in the attributes or as a separate property.
-        # ds.attrs["source"] = store_path
-        obj = cls(data_vars=ds.data_vars, coords=ds.coords)
-        obj.encoding = ds.encoding
-        obj.attrs = ds.attrs
-        obj.session = session
-        obj.repo = repo
-        return obj
-
-    def make_write_session(self):
-        self.session = self.repo.writable_session("main")
-    
-    def to_icechunk(self,store=None,commit_name="commit_", cache_config={}, **kwargs):
-        '''store must be either path to zarr store or icechunk repo, not technically an icechunk store (ik, confusing)'''
-        if store is not None:
-            if isinstance(store, (str, os.PathLike)):
-                store_path = store
-                storage_config = ic.local_filesystem_storage(store_path)
-                config = ic.RepositoryConfig.default()
-                config.caching = ic.CachingConfig(**cache_config)
-                if not ic.Repository.exists(storage_config):
-                    self.repo = ic.Repository.create(storage_config,config)
-                else:
-                    self.repo = ic.Repository.open(storage_config, config)
-            else:
-                self.repo = store
-        write_session = self.repo.writable_session("main")
-        to_icechunk(self,write_session,**kwargs)
-        write_session.commit(commit_name)
-        self.session = self.repo.readonly_session("main")
     #TODO Implement open_s3_zarr if I want this later
 
     def unify_convert_chunks(self,out_path):
@@ -214,7 +162,4 @@ class GRAnData(xr.Dataset):
         new_self = self.unify_chunks()
         for k in new_self.keys():
             new_self[k] = new_self[k].chunk({k:new_self.chunks[k] for k in new_self[k].dims})
-        if '.icechunk' in out_path:
-            new_self.to_icechunk(out_path,mode='w')
-        else:
-            new_self.to_zarr(out_path,mode='w')
+        new_self.to_zarr(out_path,mode='w')

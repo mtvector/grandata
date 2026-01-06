@@ -6,7 +6,7 @@ from grandata import GRAnData, GRAnDataModule
 from grandata.seq_io import DNATransform, hot_encoding_to_sequence, one_hot_encode_sequence
 
 
-def _build_module_dataset():
+def _build_module_dataset(tmp_path):
     obs_names = np.array(["obs0", "obs1", "obs2"])
     var_names = np.array(["chr1:0-6", "chr1:6-12", "chr1:12-18", "chr1:18-24"])
     seq_bins = np.arange(2)
@@ -51,21 +51,29 @@ def _build_module_dataset():
         ),
     }
 
-    return GRAnData(**data_vars)
+    adata = GRAnData(**data_vars)
+    out_path = tmp_path / "module_align.zarr"
+    adata.to_zarr(out_path, mode="w")
+    return GRAnData.open_zarr(out_path, consolidated=False)
 
 
-def test_grandata_module_alignment_and_shuffle(monkeypatch):
-    adata = _build_module_dataset()
+def test_grandata_module_alignment_and_shuffle(monkeypatch, tmp_path):
+    adata = _build_module_dataset(tmp_path)
 
     fixed_perm = np.array([2, 0, 1])
     monkeypatch.setattr(np.random, "permutation", lambda n: fixed_perm)
 
-    transform = DNATransform(out_len=4, random_rc=False, max_shift=None)
+    transform = DNATransform(out_len=4, random_rc=False, max_shift=None, apply_states=("train", "val"))
+    transforms = {
+        "sequence": [
+            transform
+        ]
+    }
     module = GRAnDataModule(
         adatas=adata,
         batch_size=2,
         load_keys={"X": "atac_tracks", "rna_tracks": "rna_tracks", "sequences": "sequence"},
-        dnatransform=transform,
+        transforms=transforms,
         shuffle_dims=["obs"],
     )
     module.setup("train")

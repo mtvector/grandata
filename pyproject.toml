@@ -11,9 +11,7 @@ package-mode = true
 [tool.poetry.dependencies]
 python      = ">=3.11,<4.0"
 xarray      = "*"
-xbatcher    = "*"
 dask        = "*"
-icechunk    = "*"
 zarr        = ">=3.0.0"
 pybigtools  = ">=0.2.4"
 pandas      = "*"

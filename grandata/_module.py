@@ -1,81 +1,21 @@
 import numpy as np
-import xbatcher
-import xarray as xr
-from torchdata.nodes import (
-    BaseNode, Loader, ParallelMapper, IterableWrapper,
-    Prefetcher, PinMemory, MultiNodeWeightedSampler
-)
-
-class TensorConverter:
-    '''Converter from xarray.Dataset → dict of numpy/torch arrays'''
-    def __init__(self, load_keys: dict[str,str], as_numpy: bool = True):
-        self.load_keys = load_keys
-        self.as_numpy = as_numpy
-        if not as_numpy:
-            import torch
-            self.torch = torch
-
-    def __call__(self, batch: xr.Dataset) -> dict[str, np.ndarray]:
-        out = {}
-        for xr_key, tensor_key in self.load_keys.items():
-            arr = batch[xr_key].values
-            if self.as_numpy:
-                out[tensor_key] = arr
-            else:
-                out[tensor_key] = self.torch.as_tensor(arr)
-        return out
-
-class DNATransformApplicator:
-    '''Reverse‐complement + shuffle applicator, handling multiple sequence vars'''
-    def __init__(
-        self,
-        state: str,
-        instructions: dict[str,dict[str,bool]],
-        dnatransform,
-        shuffle_dims: list[str] | None = None,
-        sequence_vars: list[str] | None = None,
-    ):
-        self.state = state
-        self.instructions = instructions
-        self.dnatransform = dnatransform
-        self.shuffle_dims = shuffle_dims or []
-        self.sequence_vars = sequence_vars or ["sequences"]
-
-    def __call__(self, batch: xr.Dataset) -> xr.Dataset:
-        # -- 1) reverse‐complement windowing on all sequence_vars present --
-        if self.instructions[self.state]["apply_rc"] and self.dnatransform:
-            # pick any one seq var to compute window+rc_flags
-            for key in self.sequence_vars:
-                if key in batch.data_vars:
-                    start, end, rc_flags = self.dnatransform.get_window_indices_and_rc(batch[key])
-                    batch = batch.isel(seq_len=slice(start, end))
-                    # apply rc_flags to each seq var
-                    for sv in self.sequence_vars:
-                        if sv in batch.data_vars:
-                            batch[sv] = self.dnatransform.apply_rc(batch[sv], rc_flags)
-                    break
-
-        # -- 2) shuffle any requested dims in one shot --
-        if self.instructions[self.state]["shuffle"] and self.shuffle_dims:
-            idx = {}
-            for dim in self.shuffle_dims:
-                if dim in batch.dims:
-                    idx[dim] = np.random.permutation(batch.sizes[dim])
-            if idx:
-                batch = batch.isel(idx)
-        return batch
+from torchdata.nodes import Loader, IterableWrapper, Prefetcher, PinMemory, MultiNodeWeightedSampler
+import threading
+import queue
+import traceback
+import zarr
 
 class GRAnDataModule:
     """
-    A unified data‐loading module for one or more GRAnData xarray.Datasets that produces
+    A unified data‐loading module for one or more zarr‐backed GRAnData datasets that produces
     PyTorch‐compatible dataloaders for training, validation, testing, and prediction.
 
     This class supports:
       - Sampling from multiple datasets with optional weighting (for meta‐datasets).
-      - On‐the‐fly reverse‐complement and windowing of one‐hot DNA sequence arrays.
+      - Optional per-output transforms (including DNA windowing/RC) via a unified transform interface.
       - Random shuffling along arbitrary dataset dimensions (e.g. obs).
       - Coordinate unification (inner or outer join) across multiple datasets.
-      - Asynchronous (I think?) prefetching and optional pinning of CPU memory.
+      - Asynchronous prefetching and optional pinning of CPU memory.
 
     Parameters
     ----------
@@ -90,20 +30,19 @@ class GRAnDataModule:
     load_keys : Mapping[str,str], default {'sequences':'sequences'}
         Mapping from variable names in the xarray.Dataset to the keys used in the output
         dictionary of NumPy arrays or tensors.
-    dnatransform : Optional[DNATransform]
-        Object that computes window bounds and reverse‐complement flags on sequence arrays.
     shuffle_dims : Sequence[str], default []
         Names of dataset dimensions to shuffle when `shuffle=True` (e.g. ["obs", "var"]).
     epoch_size : int, default 100000
         Reference number of batches per epoch (ignored by the loader but useful for logging).
     batch_dim : str, default "var"
         Name of the dimension along which batching and (for meta‐datasets) cross‐dataset mixing occur.
-    sequence_vars : Sequence[str], default ["sequences"]
-        Names of data variables in the dataset on which reverse‐complement windowing is applied.
+    transforms : Optional[Dict[str, Sequence[Callable]]], default None
+        Optional per-output transforms. Keys should match the output tensor names from
+        ``load_keys`` and values are lists of callables applied in order. Use the special
+        key ``"__batch__"`` for transforms that accept (batch, dims_map[, state]).
+        Per-tensor transforms may accept (array[, dims[, state]]).
     join : {'inner','outer'}, default 'inner'
         How to align coordinates across multiple datasets. Outer fills with np.nan
-    num_workers : int, default 0
-        Number of threads used by the ParallelMapper to preprocess in parallel.
     prefetch_factor : int, default 2
         Number of batches to prefetch asynchronously ahead of the GPU/CPU consumer.
     pin_memory : Optional[bool], default None
@@ -116,12 +55,12 @@ class GRAnDataModule:
     global_coords : Dict[str, np.ndarray]
         Unified coordinate arrays computed from all datasets, used for reindexing.
     instructions : Dict[str, Dict[str, bool]]
-        Per‐phase flags for whether to apply reverse‐complement ('apply_rc') and shuffling ('shuffle').
+        Per‐phase flags for whether to shuffle.
 
     Methods
     -------
     setup(state: str = "train")
-        Initializes xbatcher BatchGenerators for each underlying dataset for the given phase.
+        Initializes fast zarr batch iterators for each dataset for the given phase.
     train_dataloader
         Returns a PyTorch Loader yielding batches for training.
     val_dataloader
@@ -138,14 +77,12 @@ class GRAnDataModule:
         adatas,                                
         batch_size: int = 32,
         load_keys: dict[str,str] = {'sequences':'sequences'},
-        dnatransform=None,
+        transforms: dict[str, list] | None = None,
         shuffle_dims: list[str] = [],
         split: str = 'var-_-split',
         batch_dim: str = 'var',
-        sequence_vars: list[str]    = ['sequences'],
         weights: list[float] | None = None,
         join: str = 'inner',    # 'inner' or 'outer'
-        num_workers:  int = 0,
         prefetch_factor: int = 2,
         pin_memory:    str | None = None,
     ):
@@ -154,23 +91,21 @@ class GRAnDataModule:
             adatas = [adatas]
         self.adatas       = adatas
         self.batch_size   = batch_size
-        self.dnatransform = dnatransform
         self.shuffle_dims = shuffle_dims or []
         self.shuffle      = len(shuffle_dims) > 0
         self.load_keys    = load_keys
+        self.transforms = transforms or {}
         self.split        = split
         self.batch_dim    = batch_dim
-        self.sequence_vars = sequence_vars
-        self.num_workers  = num_workers
         self.prefetch_factor = prefetch_factor
         self.pin_memory   = pin_memory
 
         # ─ build state‐specific instructions once ────────────────────────────
         self.instructions = {
-            "train":   {"apply_rc": True,  "shuffle": self.shuffle},
-            "val":     {"apply_rc": True,  "shuffle": self.shuffle},
-            "test":    {"apply_rc": False, "shuffle": False},
-            "predict": {"apply_rc": False, "shuffle": False},
+            "train":   {"shuffle": self.shuffle},
+            "val":     {"shuffle": self.shuffle},
+            "test":    {"shuffle": False},
+            "predict": {"shuffle": False},
         }
 
         # ─ build per‐dataset weight map for MultiNodeWeightedSampler ──────────
@@ -197,52 +132,244 @@ class GRAnDataModule:
                 vals = sets[0].intersection(*sets[1:])
             self.global_coords[dim] = np.array(sorted(vals))
 
-        # ─ placeholders for per‐dataset generators ────────────────────────────
-        self._gens: list[xbatcher.BatchGenerator] = []
-        self._converter = TensorConverter(self.load_keys, as_numpy=True)
+        self._fast_configs = None
+        self._fast_fill_value = np.nan
+
+    def _build_fast_config(self, ds, state: str):
+        if "source" not in getattr(ds, "encoding", {}):
+            return None
+        reindexers = {}
+        if self.global_coords:
+            for dim, target_vals in self.global_coords.items():
+                if dim == self.batch_dim:
+                    continue
+                if dim not in ds.coords:
+                    reindexers[dim] = np.full(len(target_vals), -1, dtype=int)
+                    continue
+                src_vals = ds.coords[dim].values
+                if np.array_equal(src_vals, target_vals):
+                    continue
+                mapping = {val: i for i, val in enumerate(src_vals.tolist())}
+                indexer = np.full(len(target_vals), -1, dtype=int)
+                for i, val in enumerate(target_vals.tolist()):
+                    idx = mapping.get(val)
+                    if idx is not None:
+                        indexer[i] = idx
+                reindexers[dim] = indexer
+        store_path = ds.encoding["source"]
+        group = zarr.open_group(store_path, mode="r")
+
+        if state == "predict":
+            indices = np.arange(ds.sizes.get(self.batch_dim, 0))
+        else:
+            if self.split in group.array_keys():
+                split_arr = np.asarray(group[self.split])
+                indices = np.flatnonzero(split_arr == state)
+            else:
+                indices = np.arange(ds.sizes.get(self.batch_dim, 0))
+
+        arrays = {}
+        axes = {}
+        dims_map = {}
+        for xr_key, out_key in self.load_keys.items():
+            if xr_key not in group.array_keys():
+                return None
+            if xr_key not in ds:
+                return None
+            dims = ds[xr_key].dims
+            if self.batch_dim not in dims:
+                return None
+            arrays[out_key] = group[xr_key]
+            axes[out_key] = dims.index(self.batch_dim)
+            dims_map[out_key] = dims
+
+        return {
+            "arrays": arrays,
+            "axes": axes,
+            "dims_map": dims_map,
+            "indices": indices,
+            "batch_size": self.batch_size,
+            "prefetch_factor": self.prefetch_factor,
+            "reindexers": reindexers,
+        }
+
+    def _prefetch_iter(self, iterable, prefetch_factor: int):
+        if prefetch_factor <= 0:
+            yield from iterable
+            return
+
+        q = queue.Queue(maxsize=prefetch_factor)
+        sentinel = object()
+
+        def _producer():
+            try:
+                for item in iterable:
+                    q.put(item)
+            except Exception as exc:
+                q.put(exc)
+                q.put(traceback.format_exc())
+            finally:
+                q.put(sentinel)
+
+        t = threading.Thread(target=_producer, daemon=True)
+        t.start()
+        while True:
+            item = q.get()
+            if item is sentinel:
+                break
+            if isinstance(item, Exception):
+                msg = q.get()
+                raise RuntimeError(f"fast_zarr producer failed:\\n{msg}") from item
+            yield item
+
+    def _apply_shuffle(self, arr: np.ndarray, dims: tuple[str, ...], idx_map: dict[str, np.ndarray]):
+        for dim, perm in idx_map.items():
+            if dim not in dims:
+                continue
+            axis = dims.index(dim)
+            arr = np.take(arr, perm, axis=axis)
+        return arr
+
+    def _apply_reindex(self, arr: np.ndarray, dims: tuple[str, ...], reindexers: dict[str, np.ndarray]):
+        out = arr
+        for dim, indexer in reindexers.items():
+            if dim not in dims:
+                continue
+            axis = dims.index(dim)
+            if np.all(indexer >= 0):
+                out = np.take(out, indexer, axis=axis)
+                continue
+            out_shape = list(out.shape)
+            out_shape[axis] = len(indexer)
+            if np.issubdtype(out.dtype, np.floating):
+                out_dtype = out.dtype
+            else:
+                out_dtype = np.float32
+            out_arr = np.full(out_shape, self._fast_fill_value, dtype=out_dtype)
+            valid_mask = indexer >= 0
+            if np.any(valid_mask):
+                valid_idx = indexer[valid_mask]
+                taken = np.take(out, valid_idx, axis=axis)
+                slc = [slice(None)] * out_arr.ndim
+                slc[axis] = np.where(valid_mask)[0]
+                out_arr[tuple(slc)] = taken
+            out = out_arr
+        return out
+
+    def _resolve_transforms(self, state: str):
+        if not self.transforms:
+            return {}
+        if all(key in ("train", "val", "test", "predict") for key in self.transforms.keys()):
+            return self.transforms.get(state, {})
+        return self.transforms
+
+    def _apply_transforms(self, batch: dict, dims_map: dict[str, tuple[str, ...]], state: str):
+        transforms = self._resolve_transforms(state)
+        if not transforms:
+            return batch
+        batch_fns = transforms.get("__batch__", [])
+        for fn in batch_fns:
+            if getattr(fn, "_stateful", False):
+                batch = fn(batch, dims_map, state)
+            else:
+                try:
+                    batch = fn(batch, dims_map, state)
+                except TypeError:
+                    try:
+                        batch = fn(batch, dims_map)
+                    except TypeError:
+                        batch = fn(batch)
+        for out_key, fns in transforms.items():
+            if out_key == "__batch__":
+                continue
+            if out_key not in batch:
+                continue
+            for fn in fns:
+                if getattr(fn, "_stateful", False):
+                    batch[out_key] = fn(batch[out_key], dims_map[out_key], state)
+                else:
+                    try:
+                        batch[out_key] = fn(batch[out_key], dims_map[out_key], state)
+                    except TypeError:
+                        try:
+                            batch[out_key] = fn(batch[out_key], dims_map[out_key])
+                        except TypeError:
+                            batch[out_key] = fn(batch[out_key])
+        return batch
+
+    def _fast_batch_iter(self, cfg, state: str):
+        arrays = cfg["arrays"]
+        axes = cfg["axes"]
+        dims_map = cfg["dims_map"]
+        indices = cfg["indices"]
+        reindexers = cfg["reindexers"]
+        batch_size = cfg["batch_size"]
+        total = len(indices)
+
+        def _make_sel(arr, axis, idx):
+            if isinstance(idx, slice):
+                return tuple(idx if i == axis else slice(None) for i in range(arr.ndim))
+            return tuple(idx if i == axis else slice(None) for i in range(arr.ndim))
+
+        do_shuffle = self.instructions.get(state, {}).get("shuffle", False)
+
+        def _iter_batches():
+            for start in range(0, total, batch_size):
+                batch_idx = indices[start:start + batch_size]
+                if len(batch_idx) == 0:
+                    break
+                if len(batch_idx) > 1 and np.all(np.diff(batch_idx) == 1):
+                    sel = slice(int(batch_idx[0]), int(batch_idx[-1] + 1))
+                else:
+                    sel = batch_idx
+                batch = {}
+                for out_key, arr in arrays.items():
+                    axis = axes[out_key]
+                    selection = _make_sel(arr, axis, sel)
+                    if hasattr(arr, "oindex") and not isinstance(sel, slice):
+                        batch[out_key] = np.asarray(arr.oindex[selection])
+                    else:
+                        batch[out_key] = np.asarray(arr[selection])
+                    if reindexers:
+                        batch[out_key] = self._apply_reindex(batch[out_key], dims_map[out_key], reindexers)
+
+                if do_shuffle and self.shuffle_dims:
+                    shuffle_idx = {}
+                    for dim in self.shuffle_dims:
+                        for out_key, dims in dims_map.items():
+                            if dim in dims:
+                                axis = dims.index(dim)
+                                shuffle_idx[dim] = np.random.permutation(batch[out_key].shape[axis])
+                                break
+                    if shuffle_idx:
+                        for out_key, arr in batch.items():
+                            batch[out_key] = self._apply_shuffle(arr, dims_map[out_key], shuffle_idx)
+                batch = self._apply_transforms(batch, dims_map, state)
+                yield batch
+
+        yield from self._prefetch_iter(_iter_batches(), cfg["prefetch_factor"])
 
     def setup(self, state: str="train"):
         """Build one BatchGenerator per dataset for the given state."""
-        self._gens.clear()
+        configs = []
         for ds in self.adatas:
-            mask = ds[self.split].compute() == state
-            sub = ds.isel({self.batch_dim: mask}) if state!="predict" else ds
-            sub = sub[list(self.load_keys.keys())]
-            dims = dict(sub.sizes)
-            dims[self.batch_dim] = self.batch_size
-
-            bg = xbatcher.BatchGenerator(
-                ds=sub,
-                input_dims=dims,
-                batch_dims={self.batch_dim:self.batch_size},
-                cache=None
-            )
-            self._gens.append(bg)
+            cfg = self._build_fast_config(ds, state)
+            if cfg is None:
+                raise ValueError("fast zarr loader requires zarr-backed datasets with compatible coords.")
+            configs.append(cfg)
+        self._fast_configs = configs
 
     def _get_dataloader(self, state: str) -> Loader:
-        # ─ pick source: single‐ds or weighted mix ────────────────────────────
-        if len(self._gens)==1:
-            source = IterableWrapper(self._gens[0])
+        if len(self._fast_configs) == 1:
+            source = IterableWrapper(self._fast_batch_iter(self._fast_configs[0], state))
         else:
-            node_map = {i: IterableWrapper(g) for i,g in enumerate(self._gens)}
+            node_map = {}
+            for i, cfg in enumerate(self._fast_configs):
+                node_map[i] = IterableWrapper(self._fast_batch_iter(cfg, state))
             source = MultiNodeWeightedSampler(node_map, self.weight_map)
-
-        # ─ reindex → transform → convert → prefetch → pin → loader ──────────
-        # (we reindex *all* coords dims at once)
-        reindex_fn = lambda ds: ds.reindex(self.global_coords, fill_value=np.nan)
-        transform_applicator = DNATransformApplicator(
-            state=state,
-            instructions=self.instructions,
-            dnatransform=self.dnatransform,
-            shuffle_dims=self.shuffle_dims,
-            sequence_vars=self.sequence_vars
-        )
-        node = ParallelMapper(source, 
-                      map_fn=lambda x: self._converter(transform_applicator(reindex_fn(x))),
-                             num_workers=self.num_workers)
-        node = Prefetcher(node,prefetch_factor=self.prefetch_factor)
+        node = Prefetcher(source, prefetch_factor=self.prefetch_factor)
         if self.pin_memory is not None:
-            node = PinMemory(node,self.pin_memory)
+            node = PinMemory(node, self.pin_memory)
         return Loader(node)
         
     @property
@@ -269,3 +396,43 @@ class GRAnDataModule:
     def __repr__(self):
         return (f"GRAnDataModule(num_datasets={len(self.adatas)}, "
                 f"batch_size={self.batch_size}, shuffle={self.shuffle})")
+
+
+def _apply_dnatransform_array(arr: np.ndarray, dims: tuple[str, ...], rc_flags, start, end, dnatransform):
+    var_name, seq_name, nuc_name = dnatransform.dimnames
+    if var_name not in dims or seq_name not in dims or nuc_name not in dims:
+        return arr
+    var_axis = dims.index(var_name)
+    seq_axis = dims.index(seq_name)
+    nuc_axis = dims.index(nuc_name)
+
+    arr = np.take(arr, np.arange(start, end), axis=seq_axis)
+    if not dnatransform.random_rc:
+        return arr
+
+    arr = np.moveaxis(arr, var_axis, 0)
+    rc_idx = np.flatnonzero(rc_flags)
+    if len(rc_idx):
+        seq_axis_adj = seq_axis - (1 if seq_axis > var_axis else 0)
+        nuc_axis_adj = nuc_axis - (1 if nuc_axis > var_axis else 0)
+        arr[rc_idx] = np.flip(arr[rc_idx], axis=(seq_axis_adj, nuc_axis_adj))
+    arr = np.moveaxis(arr, 0, var_axis)
+    return arr
+
+
+def make_stateful_transform(fn, apply_states=("train", "val", "test", "predict")):
+    """
+    Wrap a transform so it only runs for selected loader states.
+
+    The wrapped callable expects the loader state as its last positional argument.
+    """
+    def _wrapped(*args, **kwargs):
+        if not args:
+            return fn(*args, **kwargs)
+        state = args[-1]
+        if apply_states and state not in apply_states:
+            return args[0]
+        return fn(*args[:-1], **kwargs)
+
+    _wrapped._stateful = True
+    return _wrapped

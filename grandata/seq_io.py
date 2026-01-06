@@ -353,7 +353,15 @@ def reverse_complement(sequence: str | list[str] | np.ndarray) -> str | np.ndarr
         )
 
 class DNATransform:
-    def __init__(self, out_len: int, random_rc: bool = False, max_shift: int = None, dimnames = ('var','seq_len','nuc',)):
+    def __init__(
+        self,
+        out_len: int,
+        random_rc: bool = False,
+        max_shift: int = None,
+        dimnames = ('var','seq_len','nuc',),
+        apply_states: tuple[str, ...] = ("train", "val"),
+        rc_states: tuple[str, ...] | None = None,
+    ):
         """
         Initialize a DNATransform.
 
@@ -366,11 +374,17 @@ class DNATransform:
         max_shift : int, optional
             The maximum number of bases to shift the window center away from the sequence midpoint.
             Defaults to 0 shift if not provided.
+        apply_states : tuple[str, ...], default ("train", "val")
+            Loader states in which windowing is applied when called as a transform.
+        rc_states : tuple[str, ...] | None
+            Loader states in which reverse complementing is applied. Defaults to apply_states.
         """
         self.out_len = out_len
         self.random_rc = random_rc
         self.max_shift_param = max_shift
         self.dimnames = dimnames
+        self.apply_states = apply_states
+        self.rc_states = rc_states if rc_states is not None else apply_states
 
     def get_window_indices(self, seq_len: int, shift: int = 0) -> (int, int):
         """
@@ -429,6 +443,37 @@ class DNATransform:
         else:
             rc_flags = np.zeros(da.sizes[self.dimnames[0]], dtype=bool)
         return start, end, rc_flags
+
+    def __call__(self, arr: np.ndarray, dims: tuple[str, ...], state: str | None = None):
+        if state is not None and self.apply_states and state not in self.apply_states:
+            return arr
+        var_name, seq_name, nuc_name = self.dimnames
+        if var_name not in dims or seq_name not in dims or nuc_name not in dims:
+            return arr
+        var_axis = dims.index(var_name)
+        seq_axis = dims.index(seq_name)
+        nuc_axis = dims.index(nuc_name)
+
+        shift = 0
+        if self.max_shift_param:
+            shift = np.random.randint(-self.max_shift_param, self.max_shift_param + 1)
+        seq_len = arr.shape[seq_axis]
+        start_idx, end_idx = self.get_window_indices(seq_len, shift=shift)
+        arr = np.take(arr, np.arange(start_idx, end_idx), axis=seq_axis)
+
+        if not self.random_rc or (state is not None and self.rc_states and state not in self.rc_states):
+            return arr
+
+        rc_flags = np.random.rand(arr.shape[var_axis]) < 0.5
+        if not np.any(rc_flags):
+            return arr
+        arr = np.moveaxis(arr, var_axis, 0)
+        rc_idx = np.flatnonzero(rc_flags)
+        seq_axis_adj = seq_axis - (1 if seq_axis > var_axis else 0)
+        nuc_axis_adj = nuc_axis - (1 if nuc_axis > var_axis else 0)
+        arr[rc_idx] = np.flip(arr[rc_idx], axis=(seq_axis_adj, nuc_axis_adj))
+        arr = np.moveaxis(arr, 0, var_axis)
+        return arr
 
     def reverse_complement(self, da):
         """
