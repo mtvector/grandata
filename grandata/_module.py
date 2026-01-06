@@ -12,7 +12,7 @@ class GRAnDataModule:
 
     This class supports:
       - Sampling from multiple datasets with optional weighting (for meta‐datasets).
-      - Optional per-output transforms (including DNA windowing/RC) via a unified transform interface.
+      - Optional per-output transforms via a unified transform interface (including DNA windowing/RC).
       - Random shuffling along arbitrary dataset dimensions (e.g. obs).
       - Coordinate unification (inner or outer join) across multiple datasets.
       - Asynchronous prefetching and optional pinning of CPU memory.
@@ -40,22 +40,33 @@ class GRAnDataModule:
         Optional per-output transforms. Keys should match the output tensor names from
         ``load_keys`` and values are lists of callables applied in order. Use the special
         key ``"__batch__"`` for transforms that accept (batch, dims_map[, state]).
-        Per-tensor transforms may accept (array[, dims[, state]]).
+        Per-tensor transforms may accept (array[, dims[, state]]). If the top-level keys
+        are loader states ("train", "val", "test", "predict"), the corresponding dict
+        is selected per state.
+    sample_weights : Optional[Sequence|Dict], default None
+        Optional per-element sampling weights along ``batch_dim``. For a single dataset,
+        pass a 1D array of length ``batch_dim``. For multi-dataset, pass a list matching
+        ``adatas`` or a dict keyed by dataset index or zarr store path. When provided
+        and non-uniform, batches are sampled with replacement and the iterator is
+        effectively infinite. When omitted or uniform, batching uses contiguous order
+        and exhausts each dataset.
     join : {'inner','outer'}, default 'inner'
         How to align coordinates across multiple datasets. Outer fills with np.nan
     prefetch_factor : int, default 2
         Number of batches to prefetch asynchronously ahead of the GPU/CPU consumer.
-    pin_memory : Optional[bool], default None
-        Device to pin memory to.
+    pin_memory : Optional[str], default None
+        Optional device string for torchdata PinMemory (e.g. "cuda").
 
     Attributes
     ----------
-    modules : List[GRAnDataModule]
-        Underlying single‐dataset modules, one per entry in `adatas`.
+    adatas : List[GRAnData]
+        Underlying datasets, normalized to a list.
     global_coords : Dict[str, np.ndarray]
         Unified coordinate arrays computed from all datasets, used for reindexing.
     instructions : Dict[str, Dict[str, bool]]
         Per‐phase flags for whether to shuffle.
+    weight_map : Dict[int, float]
+        Dataset sampling weights used by MultiNodeWeightedSampler.
 
     Methods
     -------
@@ -81,6 +92,7 @@ class GRAnDataModule:
         shuffle_dims: list[str] = [],
         split: str = 'var-_-split',
         batch_dim: str = 'var',
+        sample_weights: object | None = None,
         weights: list[float] | None = None,
         join: str = 'inner',    # 'inner' or 'outer'
         prefetch_factor: int = 2,
@@ -97,6 +109,7 @@ class GRAnDataModule:
         self.transforms = transforms or {}
         self.split        = split
         self.batch_dim    = batch_dim
+        self.sample_weights = sample_weights
         self.prefetch_factor = prefetch_factor
         self.pin_memory   = pin_memory
 
@@ -135,7 +148,7 @@ class GRAnDataModule:
         self._fast_configs = None
         self._fast_fill_value = np.nan
 
-    def _build_fast_config(self, ds, state: str):
+    def _build_fast_config(self, ds, state: str, dataset_idx: int):
         if "source" not in getattr(ds, "encoding", {}):
             return None
         reindexers = {}
@@ -168,6 +181,7 @@ class GRAnDataModule:
             else:
                 indices = np.arange(ds.sizes.get(self.batch_dim, 0))
 
+        sample_weights = self._resolve_sample_weights(ds, dataset_idx, indices)
         arrays = {}
         axes = {}
         dims_map = {}
@@ -188,10 +202,46 @@ class GRAnDataModule:
             "axes": axes,
             "dims_map": dims_map,
             "indices": indices,
+            "sample_weights": sample_weights,
             "batch_size": self.batch_size,
             "prefetch_factor": self.prefetch_factor,
             "reindexers": reindexers,
         }
+
+    def _resolve_sample_weights(self, ds, dataset_idx: int, indices: np.ndarray):
+        if self.sample_weights is None:
+            return None
+        weights = None
+        if isinstance(self.sample_weights, dict):
+            if dataset_idx in self.sample_weights:
+                weights = self.sample_weights[dataset_idx]
+            else:
+                key = ds.encoding.get("source")
+                if key in self.sample_weights:
+                    weights = self.sample_weights[key]
+        elif isinstance(self.sample_weights, (list, tuple)):
+            if len(self.sample_weights) == len(self.adatas):
+                weights = self.sample_weights[dataset_idx]
+            else:
+                weights = self.sample_weights
+        else:
+            weights = self.sample_weights
+
+        if weights is None:
+            return None
+        weights = np.asarray(weights, dtype=float)
+        if weights.ndim != 1:
+            raise ValueError("sample_weights must be a 1D array.")
+        if len(weights) != ds.sizes.get(self.batch_dim, len(weights)):
+            raise ValueError("sample_weights length must match the batch_dim size.")
+        weights = weights[indices]
+        total = weights.sum()
+        if total <= 0:
+            raise ValueError("sample_weights must have a positive sum for the selected state.")
+        weights = weights / total
+        if np.allclose(weights, weights[0]):
+            return None
+        return weights
 
     def _prefetch_iter(self, iterable, prefetch_factor: int):
         if prefetch_factor <= 0:
@@ -221,6 +271,11 @@ class GRAnDataModule:
                 msg = q.get()
                 raise RuntimeError(f"fast_zarr producer failed:\\n{msg}") from item
             yield item
+
+    def _repeat_iter(self, factory):
+        while True:
+            for item in factory():
+                yield item
 
     def _apply_shuffle(self, arr: np.ndarray, dims: tuple[str, ...], idx_map: dict[str, np.ndarray]):
         for dim, perm in idx_map.items():
@@ -302,6 +357,7 @@ class GRAnDataModule:
         axes = cfg["axes"]
         dims_map = cfg["dims_map"]
         indices = cfg["indices"]
+        weights = cfg.get("sample_weights")
         reindexers = cfg["reindexers"]
         batch_size = cfg["batch_size"]
         total = len(indices)
@@ -314,58 +370,66 @@ class GRAnDataModule:
         do_shuffle = self.instructions.get(state, {}).get("shuffle", False)
 
         def _iter_batches():
+            if weights is not None:
+                while True:
+                    yield np.random.choice(indices, size=batch_size, replace=True, p=weights)
             for start in range(0, total, batch_size):
                 batch_idx = indices[start:start + batch_size]
                 if len(batch_idx) == 0:
                     break
-                if len(batch_idx) > 1 and np.all(np.diff(batch_idx) == 1):
-                    sel = slice(int(batch_idx[0]), int(batch_idx[-1] + 1))
-                else:
-                    sel = batch_idx
-                batch = {}
-                for out_key, arr in arrays.items():
-                    axis = axes[out_key]
-                    selection = _make_sel(arr, axis, sel)
-                    if hasattr(arr, "oindex") and not isinstance(sel, slice):
-                        batch[out_key] = np.asarray(arr.oindex[selection])
-                    else:
-                        batch[out_key] = np.asarray(arr[selection])
-                    if reindexers:
-                        batch[out_key] = self._apply_reindex(batch[out_key], dims_map[out_key], reindexers)
+                yield batch_idx
 
-                if do_shuffle and self.shuffle_dims:
-                    shuffle_idx = {}
-                    for dim in self.shuffle_dims:
-                        for out_key, dims in dims_map.items():
-                            if dim in dims:
-                                axis = dims.index(dim)
-                                shuffle_idx[dim] = np.random.permutation(batch[out_key].shape[axis])
-                                break
-                    if shuffle_idx:
-                        for out_key, arr in batch.items():
-                            batch[out_key] = self._apply_shuffle(arr, dims_map[out_key], shuffle_idx)
-                batch = self._apply_transforms(batch, dims_map, state)
-                yield batch
+        for sel in _iter_batches():
+            if isinstance(sel, np.ndarray) and sel.ndim == 1 and len(sel) > 1 and np.all(np.diff(sel) == 1):
+                sel = slice(int(sel[0]), int(sel[-1] + 1))
+            batch = {}
+            for out_key, arr in arrays.items():
+                axis = axes[out_key]
+                selection = _make_sel(arr, axis, sel)
+                if hasattr(arr, "oindex") and not isinstance(sel, slice):
+                    batch[out_key] = np.asarray(arr.oindex[selection])
+                else:
+                    batch[out_key] = np.asarray(arr[selection])
+                if reindexers:
+                    batch[out_key] = self._apply_reindex(batch[out_key], dims_map[out_key], reindexers)
+
+            if do_shuffle and self.shuffle_dims:
+                shuffle_idx = {}
+                for dim in self.shuffle_dims:
+                    for out_key, dims in dims_map.items():
+                        if dim in dims:
+                            axis = dims.index(dim)
+                            shuffle_idx[dim] = np.random.permutation(batch[out_key].shape[axis])
+                            break
+                if shuffle_idx:
+                    for out_key, arr in batch.items():
+                        batch[out_key] = self._apply_shuffle(arr, dims_map[out_key], shuffle_idx)
+            batch = self._apply_transforms(batch, dims_map, state)
+            yield batch
 
         yield from self._prefetch_iter(_iter_batches(), cfg["prefetch_factor"])
 
     def setup(self, state: str="train"):
-        """Build one BatchGenerator per dataset for the given state."""
+        """Build fast zarr loader configs for each dataset and state."""
         configs = []
-        for ds in self.adatas:
-            cfg = self._build_fast_config(ds, state)
+        for idx, ds in enumerate(self.adatas):
+            cfg = self._build_fast_config(ds, state, idx)
             if cfg is None:
                 raise ValueError("fast zarr loader requires zarr-backed datasets with compatible coords.")
             configs.append(cfg)
         self._fast_configs = configs
 
     def _get_dataloader(self, state: str) -> Loader:
+        repeat = state in ("train", "val") and len(self._fast_configs) > 1
         if len(self._fast_configs) == 1:
             source = IterableWrapper(self._fast_batch_iter(self._fast_configs[0], state))
         else:
             node_map = {}
             for i, cfg in enumerate(self._fast_configs):
-                node_map[i] = IterableWrapper(self._fast_batch_iter(cfg, state))
+                if repeat:
+                    node_map[i] = IterableWrapper(self._repeat_iter(lambda cfg=cfg: self._fast_batch_iter(cfg, state)))
+                else:
+                    node_map[i] = IterableWrapper(self._fast_batch_iter(cfg, state))
             source = MultiNodeWeightedSampler(node_map, self.weight_map)
         node = Prefetcher(source, prefetch_factor=self.prefetch_factor)
         if self.pin_memory is not None:
@@ -425,6 +489,8 @@ def make_stateful_transform(fn, apply_states=("train", "val", "test", "predict")
     Wrap a transform so it only runs for selected loader states.
 
     The wrapped callable expects the loader state as its last positional argument.
+    If the state is not in ``apply_states``, the first positional argument is
+    returned unchanged.
     """
     def _wrapped(*args, **kwargs):
         if not args:

@@ -378,6 +378,12 @@ class DNATransform:
             Loader states in which windowing is applied when called as a transform.
         rc_states : tuple[str, ...] | None
             Loader states in which reverse complementing is applied. Defaults to apply_states.
+
+        Notes
+        -----
+        This object is callable and can be used directly in ``GRAnDataModule`` transforms.
+        The call signature is ``fn(array, dims, state=None)``; ``dims`` should include
+        ``dimnames`` so the transform can locate the sequence and nucleotide axes.
         """
         self.out_len = out_len
         self.random_rc = random_rc

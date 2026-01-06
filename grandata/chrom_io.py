@@ -1,4 +1,4 @@
-"""chrom_io.py – Creating AnnDataModule from bigwigs."""
+"""chrom_io.py – Create GRAnData stores and arrays from BigWig inputs."""
 
 from __future__ import annotations
 from pathlib import Path
