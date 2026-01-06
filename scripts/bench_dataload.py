@@ -27,6 +27,11 @@ def _set_dask_scheduler(scheduler: str):
         dask.config.set(scheduler="single-threaded")
     else:
         dask.config.set(scheduler=scheduler)
+    config = dask.config.config
+    dask_cfg = config.get("scheduler")
+    num_workers = config.get("num_workers")
+    pool = config.get("pool")
+    print(f"dask_config scheduler={dask_cfg} num_workers={num_workers} pool={pool}")
 
 
 def _parse_load_keys(text: str | None):

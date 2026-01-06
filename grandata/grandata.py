@@ -148,11 +148,10 @@ class GRAnData(xr.Dataset):
     def open_zarr(cls, store, **kwargs):
         ds = xr.open_zarr(store, **kwargs)
         encoding = ds.encoding
-        attrs = ds.attrs
         obj = cls(data_vars=ds.data_vars, coords=ds.coords)
         obj = cls._decode_sparse_from_vars(obj)
         obj.encoding = encoding
-        obj.attrs = attrs
+        obj.attrs = ds.attrs
         return obj
         
     def append_zarr(self, **kwargs):
