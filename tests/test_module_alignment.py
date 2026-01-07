@@ -57,6 +57,47 @@ def _build_module_dataset(tmp_path):
     return GRAnData.open_zarr(out_path, consolidated=False)
 
 
+def _build_module_dataset_with_rna_means(tmp_path):
+    obs_names = np.array(["obs0", "obs1", "obs2"])
+    var_names = np.array(["chr1:0-6", "chr1:6-12", "chr1:12-18", "chr1:18-24"])
+    seq_bins = np.arange(2)
+    gene_names = np.array(["g0", "g1"])
+
+    X = np.zeros((obs_names.size, var_names.size, seq_bins.size), dtype=np.float32)
+    for obs_idx in range(obs_names.size):
+        for var_idx in range(var_names.size):
+            for bin_idx in range(seq_bins.size):
+                X[obs_idx, var_idx, bin_idx] = obs_idx * 100 + var_idx * 10 + bin_idx
+
+    rna_means = np.zeros((obs_names.size, gene_names.size), dtype=np.float32)
+    for obs_idx in range(obs_names.size):
+        for gene_idx in range(gene_names.size):
+            rna_means[obs_idx, gene_idx] = obs_idx * 10 + gene_idx
+
+    data_vars = {
+        "X": xr.DataArray(
+            X,
+            dims=("obs", "var", "seq_bins"),
+            coords={"obs": obs_names, "var": var_names, "seq_bins": seq_bins},
+        ),
+        "rna_means": xr.DataArray(
+            rna_means,
+            dims=("obs", "gene"),
+            coords={"obs": obs_names, "gene": gene_names},
+        ),
+        "var-_-split": xr.DataArray(
+            np.array(["train"] * var_names.size, dtype=object),
+            dims=("var",),
+            coords={"var": var_names},
+        ),
+    }
+
+    adata = GRAnData(**data_vars)
+    out_path = tmp_path / "module_broadcast.zarr"
+    adata.to_zarr(out_path, mode="w")
+    return GRAnData.open_zarr(out_path, consolidated=False)
+
+
 def test_grandata_module_alignment_and_shuffle(monkeypatch, tmp_path):
     adata = _build_module_dataset(tmp_path)
 
@@ -102,3 +143,34 @@ def test_grandata_module_alignment_and_shuffle(monkeypatch, tmp_path):
 
     decoded = [hot_encoding_to_sequence(sequences[i]) for i in range(sequences.shape[0])]
     assert decoded == ["CGTA", "CCCC"]
+
+
+def test_grandata_module_broadcasts_missing_batch_dim(monkeypatch, tmp_path):
+    adata = _build_module_dataset_with_rna_means(tmp_path)
+
+    fixed_perm = np.array([2, 0, 1])
+    monkeypatch.setattr(np.random, "permutation", lambda n: fixed_perm)
+
+    module = GRAnDataModule(
+        adatas=adata,
+        batch_size=2,
+        load_keys={"X": "atac_tracks", "rna_means": "rna_means"},
+        shuffle_dims=["obs"],
+    )
+    module.setup("train")
+
+    batch = next(iter(module.train_dataloader))
+    rna_means = batch["rna_means"]
+
+    assert rna_means.shape == (2, 3, 2)
+
+    expected_base = np.array(
+        [
+            [20, 21],
+            [0, 1],
+            [10, 11],
+        ],
+        dtype=np.float32,
+    )
+    expected = np.broadcast_to(expected_base, (2,) + expected_base.shape)
+    np.testing.assert_allclose(rna_means, expected)

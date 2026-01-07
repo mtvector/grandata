@@ -29,7 +29,8 @@ class GRAnDataModule:
         Sampling probability for each dataset in `adatas`.  Default to equal weight.
     load_keys : Mapping[str,str], default {'sequences':'sequences'}
         Mapping from variable names in the xarray.Dataset to the keys used in the output
-        dictionary of NumPy arrays or tensors.
+        dictionary of NumPy arrays or tensors. Arrays missing ``batch_dim`` are broadcast
+        across the batch dimension during fast loading.
     shuffle_dims : Sequence[str], default []
         Names of dataset dimensions to shuffle when `shuffle=True` (e.g. ["obs", "var"]).
     epoch_size : int, default 100000
@@ -185,22 +186,29 @@ class GRAnDataModule:
         arrays = {}
         axes = {}
         dims_map = {}
+        expand_batch = {}
         for xr_key, out_key in self.load_keys.items():
             if xr_key not in group.array_keys():
                 return None
             if xr_key not in ds:
                 return None
             dims = ds[xr_key].dims
-            if self.batch_dim not in dims:
-                return None
             arrays[out_key] = group[xr_key]
-            axes[out_key] = dims.index(self.batch_dim)
-            dims_map[out_key] = dims
+            if self.batch_dim in dims:
+                axes[out_key] = dims.index(self.batch_dim)
+                dims_map[out_key] = dims
+                expand_batch[out_key] = False
+            else:
+                # Broadcast arrays missing batch_dim across the batch.
+                axes[out_key] = 0
+                dims_map[out_key] = (self.batch_dim,) + dims
+                expand_batch[out_key] = True
 
         return {
             "arrays": arrays,
             "axes": axes,
             "dims_map": dims_map,
+            "expand_batch": expand_batch,
             "indices": indices,
             "sample_weights": sample_weights,
             "batch_size": self.batch_size,
@@ -356,6 +364,7 @@ class GRAnDataModule:
         arrays = cfg["arrays"]
         axes = cfg["axes"]
         dims_map = cfg["dims_map"]
+        expand_batch = cfg.get("expand_batch", {})
         indices = cfg["indices"]
         weights = cfg.get("sample_weights")
         reindexers = cfg["reindexers"]
@@ -385,11 +394,19 @@ class GRAnDataModule:
             batch = {}
             for out_key, arr in arrays.items():
                 axis = axes[out_key]
-                selection = _make_sel(arr, axis, sel)
-                if hasattr(arr, "oindex") and not isinstance(sel, slice):
-                    batch[out_key] = np.asarray(arr.oindex[selection])
+                if expand_batch.get(out_key, False):
+                    base = np.asarray(arr)
+                    if isinstance(sel, slice):
+                        batch_n = int(sel.stop - sel.start)
+                    else:
+                        batch_n = int(len(sel))
+                    batch[out_key] = np.broadcast_to(base, (batch_n,) + base.shape)
                 else:
-                    batch[out_key] = np.asarray(arr[selection])
+                    selection = _make_sel(arr, axis, sel)
+                    if hasattr(arr, "oindex") and not isinstance(sel, slice):
+                        batch[out_key] = np.asarray(arr.oindex[selection])
+                    else:
+                        batch[out_key] = np.asarray(arr[selection])
                 if reindexers:
                     batch[out_key] = self._apply_reindex(batch[out_key], dims_map[out_key], reindexers)
 
