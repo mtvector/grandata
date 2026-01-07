@@ -10,6 +10,8 @@ from pathlib import Path
 from itertools import product
 import re
 from typing import Union, Literal, List, Tuple, Dict
+import dask.array as da
+import weakref
 
 from . import GRAnData
 # from gtfparse import read_gtf
@@ -66,13 +68,16 @@ def read_h5ad_selective_to_grandata(
     filename: Union[str, Path],
     mode: Literal["r", "r+"] = "r",
     selected_fields: List[str] = None,
+    use_dask: bool = True,
+    chunks: dict | None = None,
 ) -> GRAnData:
     """
     Based on similar function from ANTIPODE.
     Read just the specified top‐level AnnData fields (e.g. "X","obs","var","layers", etc.)
-    from an .h5ad file via h5py, reconstruct sparse/categorical if needed,
-    and return a GRAnData (xarray.Dataset). This version unpacks obs/var
-    into -_- columns so we never pass a DataFrame into GRAnData.__init__.
+    from an .h5ad file via h5py, and return a GRAnData (xarray.Dataset).
+    This version unpacks obs/var into -_- columns so we never pass a DataFrame
+    into GRAnData.__init__. If use_dask is True, datasets are wrapped as
+    dask arrays and sparse CSR matrices are stored as components.
     """
     selected_fields = selected_fields or ["X", "obs", "var"]
 
@@ -99,23 +104,35 @@ def read_h5ad_selective_to_grandata(
                 pruned[k] = tree_dict[k]
         return pruned
 
-    def read_h5_to_dict(group, subtree):
-        def helper(grp, sub):
+    def read_h5_to_dict(group, subtree, eager_groups=None):
+        eager_groups = set(eager_groups or [])
+
+        def helper(grp, sub, top_key=None):
             out = {}
             for k, v in sub.items():
                 if isinstance(v, dict):
-                    out[k] = helper(grp[k], v) if (k in grp and isinstance(grp[k], h5py.Group)) else None
+                    out[k] = (
+                        helper(grp[k], v, top_key=k if top_key is None else top_key)
+                        if (k in grp and isinstance(grp[k], h5py.Group))
+                        else None
+                    )
                 else:
                     if k in grp and isinstance(grp[k], h5py.Dataset):
                         ds = grp[k]
                         if ds.shape == ():
                             out[k] = ds[()]
                         else:
-                            arr = ds[...]
-                            if arr.dtype.kind == "S":
-                                # decode raw bytes to Unicode
-                                arr = arr.astype("U")
-                            out[k] = arr
+                            if use_dask and (top_key not in eager_groups):
+                                if ds.dtype.hasobject:
+                                    out[k] = da.from_array(ds, chunks=ds.shape)
+                                else:
+                                    out[k] = da.from_array(ds, chunks=chunks or "auto")
+                            else:
+                                arr = ds[...]
+                                if arr.dtype.kind == "S":
+                                    # decode raw bytes to Unicode
+                                    arr = arr.astype("U")
+                                out[k] = arr
                     else:
                         out[k] = None
             return out
@@ -145,6 +162,14 @@ def read_h5ad_selective_to_grandata(
             elif not isinstance(v, dict):
                 arr = np.asarray(v)
                 if arr.ndim == 1 and arr.shape[0] == length:
+                    if arr.dtype.kind == "O":
+                        arr = np.array(
+                            [
+                                x.decode("utf-8") if isinstance(x, (bytes, np.bytes_)) else x
+                                for x in arr
+                            ],
+                            dtype="U",
+                        )
                     if arr.dtype.kind == "S":
                         # decode raw bytes to Unicode
                         arr = arr.astype("U")
@@ -153,10 +178,10 @@ def read_h5ad_selective_to_grandata(
 
     # ————— Read HDF5 and prune ——————————————————————————————————
 
-    with h5py.File(filename, mode) as f:
-        full_tree = h5_tree(f)
-        pruned = prune_tree(full_tree, selected_fields)
-        raw = read_h5_to_dict(f, pruned)
+    f = h5py.File(filename, mode)
+    full_tree = h5_tree(f)
+    pruned = prune_tree(full_tree, selected_fields)
+    raw = read_h5_to_dict(f, pruned, eager_groups={"obs", "var"})
 
     data_vars = {}
     coords = {}
@@ -212,11 +237,14 @@ def read_h5ad_selective_to_grandata(
     if "X" in raw:
         xraw = raw["X"]
         if isinstance(xraw, dict) and {"data", "indices", "indptr"} <= set(xraw):
-            csr_mat = csr_matrix((xraw["data"], xraw["indices"], xraw["indptr"]))
-            arr = sparse.COO.from_scipy_sparse(csr_mat)
+            # Keep CSR components as separate arrays; materialize on demand via helper.
+            data_vars["X_data"] = xr.DataArray(xraw["data"], dims=("X_nnz",))
+            data_vars["X_indices"] = xr.DataArray(xraw["indices"], dims=("X_nnz",))
+            data_vars["X_indptr"] = xr.DataArray(xraw["indptr"], dims=("X_indptr",))
+            shape = xraw.get("shape", (len(coords["obs"]), len(coords["var"])))
+            data_vars["X_shape"] = xr.DataArray(np.asarray(shape), dims=("X_shape_dim",))
         else:
-            arr = np.asarray(xraw)
-        data_vars["X"] = xr.DataArray(arr, dims=("obs", "var"), coords=coords)
+            data_vars["X"] = xr.DataArray(xraw, dims=("obs", "var"), coords=coords)
 
     # — layers/obsm/varm/obsp ——————————————————————————————————————————
     for grp in ("layers", "obsm", "varm", "obsp"):
@@ -225,10 +253,25 @@ def read_h5ad_selective_to_grandata(
                 if val is None:
                     continue
                 if isinstance(val, dict) and {"data", "indices", "indptr"} <= set(val):
-                    csr_mat = csr_matrix((val["data"], val["indices"], val["indptr"]))
-                    arr = sparse.COO.from_scipy_sparse(csr_mat)
+                    # Keep CSR components; name them with the group prefix.
+                    prefix = f"{grp}-_-{name}"
+                    data_vars[f"{prefix}_data"] = xr.DataArray(val["data"], dims=(f"{prefix}_nnz",))
+                    data_vars[f"{prefix}_indices"] = xr.DataArray(val["indices"], dims=(f"{prefix}_nnz",))
+                    data_vars[f"{prefix}_indptr"] = xr.DataArray(val["indptr"], dims=(f"{prefix}_indptr",))
+                    shape = val.get("shape")
+                    if shape is None:
+                        if grp == "layers":
+                            shape = (len(coords["obs"]), len(coords["var"]))
+                        elif grp == "obsm":
+                            shape = (len(coords["obs"]),)
+                        elif grp == "varm":
+                            shape = (len(coords["var"]),)
+                        else:
+                            shape = (len(coords["obs"]), len(coords["obs"]))
+                    data_vars[f"{prefix}_shape"] = xr.DataArray(np.asarray(shape), dims=(f"{prefix}_shape_dim",))
+                    continue
                 else:
-                    arr = np.asarray(val)
+                    arr = val
 
                 if grp == "layers":
                     dims, c = ("obs", "var"), coords
@@ -245,7 +288,51 @@ def read_h5ad_selective_to_grandata(
                 data_vars[f"{grp}-_-{name}"] = xr.DataArray(arr, dims=dims, coords=c)
 
     # ——— Finally, build and return GRAnData ——————————————————————
-    return GRAnData(data_vars=data_vars, coords=coords)
+    ds = GRAnData(data_vars=data_vars, coords=coords)
+    if use_dask:
+        # Keep the HDF5 file open for lazy dask reads.
+        ds.attrs["_h5py_file"] = f
+        ds.attrs["_h5py_file_finalizer"] = weakref.finalize(ds, f.close)
+    else:
+        f.close()
+    return ds
+
+
+def materialize_csr_array(
+    ds: xr.Dataset,
+    prefix: str,
+    dense: bool = False,
+):
+    """
+    Materialize CSR components stored in the dataset into a scipy CSR matrix
+    or a dense ndarray (if dense=True). Prefix examples: "X", "layers-_-counts".
+    """
+    data = ds[f"{prefix}_data"].data
+    indices = ds[f"{prefix}_indices"].data
+    indptr = ds[f"{prefix}_indptr"].data
+    shape = tuple(ds[f"{prefix}_shape"].values.tolist())
+    if hasattr(data, "compute"):
+        data = data.compute()
+    if hasattr(indices, "compute"):
+        indices = indices.compute()
+    if hasattr(indptr, "compute"):
+        indptr = indptr.compute()
+    csr_mat = csr_matrix((data, indices, indptr), shape=shape)
+    if dense:
+        return csr_mat.toarray()
+    return csr_mat
+
+
+def close_h5_backing(ds: xr.Dataset) -> None:
+    """
+    Close the backing HDF5 file for datasets created with use_dask=True.
+    """
+    f = ds.attrs.pop("_h5py_file", None)
+    finalizer = ds.attrs.pop("_h5py_file_finalizer", None)
+    if finalizer is not None:
+        finalizer()
+    elif f is not None:
+        f.close()
 
 def write_tss_bigwigs(
     matrix: np.ndarray | xr.DataArray,
@@ -424,7 +511,8 @@ def group_aggr_xr(
     categories: Union[str, List[str]],
     agg_func=np.mean,
     normalize: bool = False,
-    materialize: bool = True,
+    materialize: bool = False,
+    progress: bool = False,
 ) -> xr.DataArray:
     """
     Group–aggregate an xarray.Dataset along 'obs' by one or more categorical
@@ -447,6 +535,8 @@ def group_aggr_xr(
         If True, each observation is normalized by its row-sum before grouping.
     materialize
         If False, return the grouped DataArray without densifying or reshaping.
+    progress
+        If True, show a progress bar when computing dask-backed results.
 
     Returns
     -------
@@ -465,36 +555,100 @@ def group_aggr_xr(
         raise ValueError("Must supply at least one category name")
 
     # — pick the DataArray and its dims —
-    da = ds[array_name]
-    obs_dim, var_dim = da.dims[:2]
-    # capture the original var-axis coordinate
-    var_coord = da.coords[var_dim]
+    has_csr_components = f"{array_name}_data" in ds
+    if array_name in ds:
+        da = ds[array_name]
+        obs_dim, var_dim = da.dims[:2]
+        # capture the original var-axis coordinate
+        var_coord = da.coords[var_dim]
+    elif has_csr_components:
+        da = None
+        obs_dim, var_dim = "obs", "var"
+        var_coord = ds.coords[var_dim]
+    else:
+        raise KeyError(f"No variable named '{array_name}' and no CSR components found.")
 
     # — collect category arrays & orders —
     category_orders = {}
     cat_arrs = []
     for cat in categories:
-        arr = ds[cat].values.astype(str)
+        arr = ds[cat].data
+        if hasattr(arr, "compute"):
+            arr = arr.compute()
+        arr = np.asarray(arr).astype(str)
         # preserve first-appearance order
         seen = dict.fromkeys(arr.tolist())
         category_orders[cat] = list(seen.keys())
         cat_arrs.append(arr)
 
-    # — build a combined grouping key (string) for xarray.groupby —
+    # — build grouping labels —
     if len(categories) == 1:
         group_key = categories[0]
-        grouping = xr.DataArray(cat_arrs[0],
-                                dims=obs_dim,
-                                coords={obs_dim: ds.coords[obs_dim]})
+        group_labels = cat_arrs[0]
     else:
         sep = "____"
-        combo = cat_arrs[0].astype('<U0')
+        combo = cat_arrs[0].astype("U")
         for arr in cat_arrs[1:]:
             combo = np.char.add(np.char.add(combo, sep), arr)
         group_key = sep.join(categories)
-        grouping = xr.DataArray(combo,
-                                dims=obs_dim,
-                                coords={obs_dim: ds.coords[obs_dim]})
+        group_labels = combo
+
+    # — fast sparse aggregation path for CSR components —
+    if has_csr_components and agg_func in (np.mean, np.std):
+        csr_mat = materialize_csr_array(ds, array_name, dense=False)
+        obs_dim, var_dim = "obs", "var"
+        n_obs, n_vars = csr_mat.shape
+
+        if normalize:
+            row_sums = np.asarray(csr_mat.sum(axis=1)).ravel()
+            inv = np.reciprocal(row_sums, where=row_sums != 0)
+            csr_mat = csr_mat.multiply(inv[:, None])
+
+        if len(categories) == 1:
+            cat = categories[0]
+            levels = category_orders[cat]
+            level_index = {v: i for i, v in enumerate(levels)}
+            col_idx = np.fromiter((level_index[v] for v in group_labels), dtype=int, count=n_obs)
+            dims = [cat, var_dim]
+            coords = {cat: levels, var_dim: ds.coords[var_dim]}
+            n_groups = len(levels)
+        else:
+            lists_of_levels = [category_orders[c] for c in categories]
+            all_combos = list(product(*lists_of_levels))
+            combo_strs = [sep.join(c) for c in all_combos]
+            combo_index = {v: i for i, v in enumerate(combo_strs)}
+            col_idx = np.fromiter((combo_index[v] for v in group_labels), dtype=int, count=n_obs)
+            dims = categories + [var_dim]
+            coords = {var_dim: ds.coords[var_dim]}
+            for cat in categories:
+                coords[cat] = category_orders[cat]
+            n_groups = len(combo_strs)
+        rows = np.arange(n_obs, dtype=int)
+        ones = np.ones(n_obs, dtype=float)
+        g_mat = csr_matrix((ones, (rows, col_idx)), shape=(n_obs, n_groups))
+        counts = np.bincount(col_idx, minlength=n_groups).astype(float)
+        inv_counts = np.reciprocal(counts, where=counts != 0)
+        sum_mat = g_mat.T @ csr_mat
+        mean_mat = sum_mat.multiply(inv_counts[:, None])
+
+        if agg_func is np.mean:
+            result_mat = mean_mat
+        else:
+            sumsq_mat = g_mat.T @ csr_mat.multiply(csr_mat)
+            mean_sq = sumsq_mat.multiply(inv_counts[:, None])
+            var_mat = mean_sq - mean_mat.multiply(mean_mat)
+            var_mat.data = np.maximum(var_mat.data, 0.0)
+            var_mat.data = np.sqrt(var_mat.data)
+            result_mat = var_mat
+
+        return xr.DataArray(
+            sparse.COO.from_scipy_sparse(result_mat),
+            dims=dims,
+            coords=coords,
+        )
+
+    # — build a combined grouping key (string) for xarray.groupby —
+    grouping = xr.DataArray(group_labels, dims=obs_dim, coords={obs_dim: ds.coords[obs_dim]})
 
     # assign the grouping coordinate (internally) so we can group by it
     da = da.assign_coords(**{group_key: grouping})
@@ -507,15 +661,14 @@ def group_aggr_xr(
     grouped = da.groupby(group_key).reduce(agg_func, dim=obs_dim)
     if not materialize:
         return grouped
-
-    # — pull out the raw numpy array, densify if sparse-backed —
-    raw = grouped.data
-    if hasattr(raw, "todense"):
-        arr = raw.todense()
-    elif hasattr(raw, "toarray"):
-        arr = raw.toarray()
-    else:
-        arr = np.asarray(raw)
+    if hasattr(grouped.data, "compute"):
+        if progress:
+            from dask.diagnostics import ProgressBar
+            with ProgressBar():
+                grouped = grouped.compute()
+        else:
+            grouped = grouped.compute()
+    arr = np.asarray(grouped.data)
 
     # — reorder and reshape into (*category_sizes, n_vars) —
     n_vars = da.sizes[var_dim]
