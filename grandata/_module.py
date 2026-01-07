@@ -502,3 +502,52 @@ def make_stateful_transform(fn, apply_states=("train", "val", "test", "predict")
 
     _wrapped._stateful = True
     return _wrapped
+
+
+def make_rc_signflip_transform(
+    seq_key: str,
+    flip_keys: list[str],
+    dnatransform,
+    batch_dim: str = "var",
+):
+    """
+    Create a batch transform that applies a DNATransform to sequences and flips
+    the sign of selected outputs when reverse complemented.
+    """
+    def _transform(batch: dict, dims_map: dict[str, tuple[str, ...]], state: str | None = None):
+        if state is not None and dnatransform.apply_states and state not in dnatransform.apply_states:
+            return batch
+        if seq_key not in batch or seq_key not in dims_map:
+            return batch
+        dims = dims_map[seq_key]
+        var_name, seq_name, nuc_name = dnatransform.dimnames
+        if var_name not in dims or seq_name not in dims or nuc_name not in dims:
+            return batch
+        var_axis = dims.index(var_name)
+        seq_axis = dims.index(seq_name)
+        arr = batch[seq_key]
+        shift = 0
+        if dnatransform.max_shift_param:
+            shift = np.random.randint(-dnatransform.max_shift_param, dnatransform.max_shift_param + 1)
+        start, end = dnatransform.get_window_indices(arr.shape[seq_axis], shift=shift)
+        rc_flags = np.zeros(arr.shape[var_axis], dtype=bool)
+        if dnatransform.random_rc and (state is None or not dnatransform.rc_states or state in dnatransform.rc_states):
+            rc_flags = np.random.rand(arr.shape[var_axis]) < 0.5
+        batch[seq_key] = _apply_dnatransform_array(arr, dims, rc_flags, start, end, dnatransform)
+        if not np.any(rc_flags):
+            return batch
+        rc_idx = np.flatnonzero(rc_flags)
+        for key in flip_keys:
+            if key not in batch or key not in dims_map:
+                continue
+            key_dims = dims_map[key]
+            if batch_dim not in key_dims:
+                continue
+            axis = key_dims.index(batch_dim)
+            arr_key = np.moveaxis(batch[key], axis, 0)
+            arr_key[rc_idx] *= -1
+            batch[key] = np.moveaxis(arr_key, 0, axis)
+        return batch
+
+    _transform._stateful = True
+    return _transform
