@@ -5,6 +5,17 @@ import queue
 import traceback
 import zarr
 
+
+class _GeneratorIterable:
+    """Return a fresh iterator on each __iter__ call."""
+
+    def __init__(self, factory):
+        self._factory = factory
+
+    def __iter__(self):
+        return self._factory()
+
+
 class GRAnDataModule:
     """
     A unified data‐loading module for one or more zarr‐backed GRAnData datasets that produces
@@ -439,14 +450,16 @@ class GRAnDataModule:
     def _get_dataloader(self, state: str) -> Loader:
         repeat = state in ("train", "val") and len(self._fast_configs) > 1
         if len(self._fast_configs) == 1:
-            source = IterableWrapper(self._fast_batch_iter(self._fast_configs[0], state))
+            factory = lambda: self._fast_batch_iter(self._fast_configs[0], state)
+            source = IterableWrapper(_GeneratorIterable(factory))
         else:
             node_map = {}
             for i, cfg in enumerate(self._fast_configs):
                 if repeat:
-                    node_map[i] = IterableWrapper(self._repeat_iter(lambda cfg=cfg: self._fast_batch_iter(cfg, state)))
+                    factory = lambda cfg=cfg: self._repeat_iter(lambda cfg=cfg: self._fast_batch_iter(cfg, state))
                 else:
-                    node_map[i] = IterableWrapper(self._fast_batch_iter(cfg, state))
+                    factory = lambda cfg=cfg: self._fast_batch_iter(cfg, state)
+                node_map[i] = IterableWrapper(_GeneratorIterable(factory))
             source = MultiNodeWeightedSampler(node_map, self.weight_map)
         node = Prefetcher(source, prefetch_factor=self.prefetch_factor)
         if self.pin_memory is not None:
