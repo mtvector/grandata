@@ -1,4 +1,9 @@
+import math
 import numpy as np
+import os
+import sys
+import time
+from collections import defaultdict
 from torchdata.nodes import Loader, IterableWrapper, Prefetcher, PinMemory, MultiNodeWeightedSampler
 import threading
 import queue
@@ -62,6 +67,14 @@ class GRAnDataModule:
         and non-uniform, batches are sampled with replacement and the iterator is
         effectively infinite. When omitted or uniform, batching uses contiguous order
         and exhausts each dataset.
+    sample_weight_block_size : Optional[int], default None
+        When using non-uniform ``sample_weights``, sample contiguous blocks of this size
+        using block-summed weights to reduce random chunk reads. When None, uses fully
+        random indices.
+    sample_weight_min_unique : Optional[int], default None
+        Minimum number of unique points to cover per sampling cycle when using block
+        sampling. The loader samples blocks without replacement until this threshold
+        is reached, then reshuffles.
     join : {'inner','outer'}, default 'inner'
         How to align coordinates across multiple datasets. Outer fills with np.nan
     prefetch_factor : int, default 2
@@ -105,6 +118,8 @@ class GRAnDataModule:
         split: str = 'var-_-split',
         batch_dim: str = 'var',
         sample_weights: object | None = None,
+        sample_weight_block_size: int | None = None,
+        sample_weight_min_unique: int | None = None,
         weights: list[float] | None = None,
         join: str = 'inner',    # 'inner' or 'outer'
         prefetch_factor: int = 2,
@@ -122,6 +137,8 @@ class GRAnDataModule:
         self.split        = split
         self.batch_dim    = batch_dim
         self.sample_weights = sample_weights
+        self.sample_weight_block_size = sample_weight_block_size
+        self.sample_weight_min_unique = sample_weight_min_unique
         self.prefetch_factor = prefetch_factor
         self.pin_memory   = pin_memory
 
@@ -222,6 +239,8 @@ class GRAnDataModule:
             "expand_batch": expand_batch,
             "indices": indices,
             "sample_weights": sample_weights,
+            "sample_weight_block_size": self.sample_weight_block_size,
+            "sample_weight_min_unique": self.sample_weight_min_unique,
             "batch_size": self.batch_size,
             "prefetch_factor": self.prefetch_factor,
             "reindexers": reindexers,
@@ -378,9 +397,19 @@ class GRAnDataModule:
         expand_batch = cfg.get("expand_batch", {})
         indices = cfg["indices"]
         weights = cfg.get("sample_weights")
+        block_size = cfg.get("sample_weight_block_size")
+        min_unique = cfg.get("sample_weight_min_unique")
         reindexers = cfg["reindexers"]
         batch_size = cfg["batch_size"]
         total = len(indices)
+        profile = os.getenv("GRANDATA_PROFILE") == "1"
+        profile_max = int(os.getenv("GRANDATA_PROFILE_BATCHES", "20")) if profile else 0
+        prof_batches_done = 0
+        prof_total_time = 0.0
+        prof_key_time = defaultdict(float)
+        prof_key_count = defaultdict(int)
+        prof_key_oindex = defaultdict(int)
+        prof_key_slice = defaultdict(int)
 
         def _make_sel(arr, axis, idx):
             if isinstance(idx, slice):
@@ -391,8 +420,40 @@ class GRAnDataModule:
 
         def _iter_batches():
             if weights is not None:
-                while True:
-                    yield np.random.choice(indices, size=batch_size, replace=True, p=weights)
+                if block_size is not None and block_size > 0:
+                    block_size_eff = min(int(block_size), total)
+                    starts = np.arange(0, total, block_size_eff)
+                    block_weights = np.zeros(len(starts), dtype=float)
+                    for i, start in enumerate(starts):
+                        block_weights[i] = weights[start : min(start + block_size_eff, total)].sum()
+                    total_bw = block_weights.sum()
+                    if total_bw <= 0:
+                        raise ValueError("sample_weights must have a positive sum for block sampling.")
+                    block_probs = block_weights / total_bw
+                    blocks_per_cycle = None
+                    if min_unique is not None and min_unique > 0:
+                        blocks_per_cycle = min(
+                            len(starts),
+                            max(1, int(math.ceil(min_unique / block_size_eff))),
+                        )
+                    while True:
+                        if blocks_per_cycle is None:
+                            block_idx = np.random.choice(len(starts), p=block_probs)
+                            start = starts[block_idx]
+                            yield indices[start : start + block_size_eff]
+                        else:
+                            chosen = np.random.choice(
+                                len(starts),
+                                size=blocks_per_cycle,
+                                replace=False,
+                                p=block_probs,
+                            )
+                            for block_idx in chosen:
+                                start = starts[block_idx]
+                                yield indices[start : start + block_size_eff]
+                else:
+                    while True:
+                        yield np.random.choice(indices, size=batch_size, replace=True, p=weights)
             for start in range(0, total, batch_size):
                 batch_idx = indices[start:start + batch_size]
                 if len(batch_idx) == 0:
@@ -400,24 +461,41 @@ class GRAnDataModule:
                 yield batch_idx
 
         for sel in _iter_batches():
+            profiling_active = profile and prof_batches_done < profile_max
+            if profiling_active:
+                batch_start = time.perf_counter()
             if isinstance(sel, np.ndarray) and sel.ndim == 1 and len(sel) > 1 and np.all(np.diff(sel) == 1):
                 sel = slice(int(sel[0]), int(sel[-1] + 1))
             batch = {}
             for out_key, arr in arrays.items():
                 axis = axes[out_key]
                 if expand_batch.get(out_key, False):
+                    if profiling_active:
+                        key_start = time.perf_counter()
                     base = np.asarray(arr)
                     if isinstance(sel, slice):
                         batch_n = int(sel.stop - sel.start)
                     else:
                         batch_n = int(len(sel))
                     batch[out_key] = np.broadcast_to(base, (batch_n,) + base.shape)
+                    if profiling_active:
+                        prof_key_time[out_key] += time.perf_counter() - key_start
+                        prof_key_count[out_key] += 1
                 else:
                     selection = _make_sel(arr, axis, sel)
+                    if profiling_active:
+                        key_start = time.perf_counter()
                     if hasattr(arr, "oindex") and not isinstance(sel, slice):
                         batch[out_key] = np.asarray(arr.oindex[selection])
+                        if profiling_active:
+                            prof_key_oindex[out_key] += 1
                     else:
                         batch[out_key] = np.asarray(arr[selection])
+                        if profiling_active:
+                            prof_key_slice[out_key] += 1
+                    if profiling_active:
+                        prof_key_time[out_key] += time.perf_counter() - key_start
+                        prof_key_count[out_key] += 1
                 if reindexers:
                     batch[out_key] = self._apply_reindex(batch[out_key], dims_map[out_key], reindexers)
 
@@ -433,6 +511,21 @@ class GRAnDataModule:
                     for out_key, arr in batch.items():
                         batch[out_key] = self._apply_shuffle(arr, dims_map[out_key], shuffle_idx)
             batch = self._apply_transforms(batch, dims_map, state)
+            if profiling_active:
+                prof_total_time += time.perf_counter() - batch_start
+                prof_batches_done += 1
+                if prof_batches_done == profile_max:
+                    print("GRANDATA_PROFILE summary", file=sys.stderr)
+                    if prof_total_time > 0:
+                        print(f"  batches: {prof_batches_done} total_s: {prof_total_time:.3f}", file=sys.stderr)
+                    for key in sorted(prof_key_time, key=prof_key_time.get, reverse=True):
+                        avg = prof_key_time[key] / max(prof_key_count[key], 1)
+                        oidx = prof_key_oindex.get(key, 0)
+                        sidx = prof_key_slice.get(key, 0)
+                        print(
+                            f"  {key}: total_s={prof_key_time[key]:.3f} avg_s={avg:.4f} oindex={oidx} slice={sidx}",
+                            file=sys.stderr,
+                        )
             yield batch
 
         yield from self._prefetch_iter(_iter_batches(), cfg["prefetch_factor"])
