@@ -4,9 +4,8 @@
 
 # grandata
 
-A *lightweight* python library for efficiently organizing and dataloading multimodal genomics data from multiple datasets (e.g. species) simultaneously. 
+A *lightweight* python library for efficiently organizing and dataloading multimodal genomics data from multiple datasets (e.g. species) simultaneously. Uses xarray with zarr backing and torchdata-nodes.
 
-Stack on: zarr -> torchdata-nodes -> ...
 
 Supports reading bigwigs, fasta, h5 via chrom_io, seq_io and tx_io to create GRAnData objects, which are thinly wrapped xarray DataSets, and thus extensible via standard XArray operations.
 
