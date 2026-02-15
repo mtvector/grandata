@@ -5,9 +5,6 @@ import sys
 import time
 from collections import defaultdict
 from torchdata.nodes import Loader, IterableWrapper, Prefetcher, PinMemory, MultiNodeWeightedSampler
-import threading
-import queue
-import traceback
 import zarr
 
 
@@ -281,35 +278,6 @@ class GRAnDataModule:
             return None
         return weights
 
-    def _prefetch_iter(self, iterable, prefetch_factor: int):
-        if prefetch_factor <= 0:
-            yield from iterable
-            return
-
-        q = queue.Queue(maxsize=prefetch_factor)
-        sentinel = object()
-
-        def _producer():
-            try:
-                for item in iterable:
-                    q.put(item)
-            except Exception as exc:
-                q.put(exc)
-                q.put(traceback.format_exc())
-            finally:
-                q.put(sentinel)
-
-        t = threading.Thread(target=_producer, daemon=True)
-        t.start()
-        while True:
-            item = q.get()
-            if item is sentinel:
-                break
-            if isinstance(item, Exception):
-                msg = q.get()
-                raise RuntimeError(f"fast_zarr producer failed:\\n{msg}") from item
-            yield item
-
     def _repeat_iter(self, factory):
         while True:
             for item in factory():
@@ -528,7 +496,9 @@ class GRAnDataModule:
                         )
             yield batch
 
-        yield from self._prefetch_iter(_iter_batches(), cfg["prefetch_factor"])
+        # Batch materialization is complete above; prefetch is handled in _get_dataloader
+        # via torchdata.nodes.Prefetcher to avoid double-prefetching or duplicate passes.
+        return
 
     def setup(self, state: str="train"):
         """Build fast zarr loader configs for each dataset and state."""
