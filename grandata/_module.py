@@ -3,6 +3,7 @@ import numpy as np
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 from torchdata.nodes import Loader, IterableWrapper, Prefetcher, PinMemory, MultiNodeWeightedSampler
 import zarr
@@ -121,6 +122,7 @@ class GRAnDataModule:
         join: str = 'inner',    # 'inner' or 'outer'
         prefetch_factor: int = 2,
         pin_memory:    str | None = None,
+        io_workers: int | None = None,
     ):
         # ─ normalize adatas to a list ──────────────────────────────────────────
         if not isinstance(adatas, (list,tuple)):
@@ -138,6 +140,7 @@ class GRAnDataModule:
         self.sample_weight_min_unique = sample_weight_min_unique
         self.prefetch_factor = prefetch_factor
         self.pin_memory   = pin_memory
+        self.io_workers = io_workers
 
         # ─ build state‐specific instructions once ────────────────────────────
         self.instructions = {
@@ -241,6 +244,7 @@ class GRAnDataModule:
             "batch_size": self.batch_size,
             "prefetch_factor": self.prefetch_factor,
             "reindexers": reindexers,
+            "io_workers": self.io_workers,
         }
 
     def _resolve_sample_weights(self, ds, dataset_idx: int, indices: np.ndarray):
@@ -378,6 +382,10 @@ class GRAnDataModule:
         prof_key_count = defaultdict(int)
         prof_key_oindex = defaultdict(int)
         prof_key_slice = defaultdict(int)
+        if cfg.get("io_workers") is not None:
+            io_workers = max(1, int(cfg["io_workers"]))
+        else:
+            io_workers = min(2, len(arrays), max(1, (os.cpu_count() or 1)))
 
         def _make_sel(arr, axis, idx):
             if isinstance(idx, slice):
@@ -428,73 +436,93 @@ class GRAnDataModule:
                     break
                 yield batch_idx
 
-        for sel in _iter_batches():
-            profiling_active = profile and prof_batches_done < profile_max
-            if profiling_active:
-                batch_start = time.perf_counter()
-            if isinstance(sel, np.ndarray) and sel.ndim == 1 and len(sel) > 1 and np.all(np.diff(sel) == 1):
-                sel = slice(int(sel[0]), int(sel[-1] + 1))
-            batch = {}
-            for out_key, arr in arrays.items():
-                axis = axes[out_key]
-                if expand_batch.get(out_key, False):
-                    if profiling_active:
-                        key_start = time.perf_counter()
-                    base = np.asarray(arr)
-                    if isinstance(sel, slice):
-                        batch_n = int(sel.stop - sel.start)
-                    else:
-                        batch_n = int(len(sel))
-                    batch[out_key] = np.broadcast_to(base, (batch_n,) + base.shape)
-                    if profiling_active:
-                        prof_key_time[out_key] += time.perf_counter() - key_start
-                        prof_key_count[out_key] += 1
+        def _load_one(out_key, arr, axis, sel):
+            key_start = time.perf_counter()
+            used_oindex = 0
+            used_slice = 0
+            if expand_batch.get(out_key, False):
+                base = np.asarray(arr)
+                if isinstance(sel, slice):
+                    batch_n = int(sel.stop - sel.start)
                 else:
-                    selection = _make_sel(arr, axis, sel)
-                    if profiling_active:
-                        key_start = time.perf_counter()
-                    if hasattr(arr, "oindex") and not isinstance(sel, slice):
-                        batch[out_key] = np.asarray(arr.oindex[selection])
-                        if profiling_active:
-                            prof_key_oindex[out_key] += 1
-                    else:
-                        batch[out_key] = np.asarray(arr[selection])
-                        if profiling_active:
-                            prof_key_slice[out_key] += 1
-                    if profiling_active:
-                        prof_key_time[out_key] += time.perf_counter() - key_start
-                        prof_key_count[out_key] += 1
-                if reindexers:
-                    batch[out_key] = self._apply_reindex(batch[out_key], dims_map[out_key], reindexers)
+                    batch_n = int(len(sel))
+                out = np.broadcast_to(base, (batch_n,) + base.shape)
+            else:
+                selection = _make_sel(arr, axis, sel)
+                if hasattr(arr, "oindex") and not isinstance(sel, slice):
+                    out = np.asarray(arr.oindex[selection])
+                    used_oindex = 1
+                else:
+                    out = np.asarray(arr[selection])
+                    used_slice = 1
+            if reindexers:
+                out = self._apply_reindex(out, dims_map[out_key], reindexers)
+            return out_key, out, time.perf_counter() - key_start, used_oindex, used_slice
 
-            if do_shuffle and self.shuffle_dims:
-                shuffle_idx = {}
-                for dim in self.shuffle_dims:
-                    for out_key, dims in dims_map.items():
-                        if dim in dims:
-                            axis = dims.index(dim)
-                            shuffle_idx[dim] = np.random.permutation(batch[out_key].shape[axis])
-                            break
-                if shuffle_idx:
-                    for out_key, arr in batch.items():
-                        batch[out_key] = self._apply_shuffle(arr, dims_map[out_key], shuffle_idx)
-            batch = self._apply_transforms(batch, dims_map, state)
-            if profiling_active:
-                prof_total_time += time.perf_counter() - batch_start
-                prof_batches_done += 1
-                if prof_batches_done == profile_max:
-                    print("GRANDATA_PROFILE summary", file=sys.stderr)
-                    if prof_total_time > 0:
-                        print(f"  batches: {prof_batches_done} total_s: {prof_total_time:.3f}", file=sys.stderr)
-                    for key in sorted(prof_key_time, key=prof_key_time.get, reverse=True):
-                        avg = prof_key_time[key] / max(prof_key_count[key], 1)
-                        oidx = prof_key_oindex.get(key, 0)
-                        sidx = prof_key_slice.get(key, 0)
-                        print(
-                            f"  {key}: total_s={prof_key_time[key]:.3f} avg_s={avg:.4f} oindex={oidx} slice={sidx}",
-                            file=sys.stderr,
-                        )
-            yield batch
+        executor = ThreadPoolExecutor(max_workers=io_workers) if io_workers > 1 and len(arrays) > 1 else None
+        try:
+            for sel in _iter_batches():
+                profiling_active = profile and prof_batches_done < profile_max
+                if profiling_active:
+                    batch_start = time.perf_counter()
+                if isinstance(sel, np.ndarray) and sel.ndim == 1 and len(sel) > 1 and np.all(np.diff(sel) == 1):
+                    sel = slice(int(sel[0]), int(sel[-1] + 1))
+                batch = {}
+                if executor is None:
+                    for out_key, arr in arrays.items():
+                        axis = axes[out_key]
+                        out_key, out, dt, used_oindex, used_slice = _load_one(out_key, arr, axis, sel)
+                        batch[out_key] = out
+                        if profiling_active:
+                            prof_key_time[out_key] += dt
+                            prof_key_count[out_key] += 1
+                            prof_key_oindex[out_key] += used_oindex
+                            prof_key_slice[out_key] += used_slice
+                else:
+                    futures = [
+                        executor.submit(_load_one, out_key, arr, axes[out_key], sel)
+                        for out_key, arr in arrays.items()
+                    ]
+                    for fut in futures:
+                        out_key, out, dt, used_oindex, used_slice = fut.result()
+                        batch[out_key] = out
+                        if profiling_active:
+                            prof_key_time[out_key] += dt
+                            prof_key_count[out_key] += 1
+                            prof_key_oindex[out_key] += used_oindex
+                            prof_key_slice[out_key] += used_slice
+
+                if do_shuffle and self.shuffle_dims:
+                    shuffle_idx = {}
+                    for dim in self.shuffle_dims:
+                        for out_key, dims in dims_map.items():
+                            if dim in dims:
+                                axis = dims.index(dim)
+                                shuffle_idx[dim] = np.random.permutation(batch[out_key].shape[axis])
+                                break
+                    if shuffle_idx:
+                        for out_key, arr in batch.items():
+                            batch[out_key] = self._apply_shuffle(arr, dims_map[out_key], shuffle_idx)
+                batch = self._apply_transforms(batch, dims_map, state)
+                if profiling_active:
+                    prof_total_time += time.perf_counter() - batch_start
+                    prof_batches_done += 1
+                    if prof_batches_done == profile_max:
+                        print("GRANDATA_PROFILE summary", file=sys.stderr)
+                        if prof_total_time > 0:
+                            print(f"  batches: {prof_batches_done} total_s: {prof_total_time:.3f}", file=sys.stderr)
+                        for key in sorted(prof_key_time, key=prof_key_time.get, reverse=True):
+                            avg = prof_key_time[key] / max(prof_key_count[key], 1)
+                            oidx = prof_key_oindex.get(key, 0)
+                            sidx = prof_key_slice.get(key, 0)
+                            print(
+                                f"  {key}: total_s={prof_key_time[key]:.3f} avg_s={avg:.4f} oindex={oidx} slice={sidx}",
+                                file=sys.stderr,
+                            )
+                yield batch
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
 
         # Batch materialization is complete above; prefetch is handled in _get_dataloader
         # via torchdata.nodes.Prefetcher to avoid double-prefetching or duplicate passes.
