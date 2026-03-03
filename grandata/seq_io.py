@@ -35,6 +35,18 @@ HOT_DECODING_TABLE[4] = ord("G")
 HOT_DECODING_TABLE[8] = ord("T")
 
 
+def _series_to_py_str_array(series: pd.Series) -> np.ndarray:
+    """Convert a pandas Series to a 1D object array of Python str."""
+    arr = series.to_numpy()
+    return np.array(
+        [
+            x.decode("utf-8") if isinstance(x, (bytes, bytearray)) else str(x)
+            for x in np.asarray(arr).tolist()
+        ],
+        dtype=object,
+    )
+
+
 def one_hot_encode_sequence(sequence: str) -> np.ndarray:
     """
     One-hot encode a DNA sequence using the pre-computed HOT_ENCODING_TABLE.
@@ -158,11 +170,11 @@ def add_genome_sequences_to_grandata(
         if fasta_path is None:
             raise ValueError("Genome FASTA path is required for backed sequence writing.")
 
-        chrom_col = ranges_df["chrom"].astype(str).to_numpy()
+        chrom_col = _series_to_py_str_array(ranges_df["chrom"])
         start_col = ranges_df["start"].astype(int).to_numpy()
         end_col = ranges_df["end"].astype(int).to_numpy()
         if "strand" in ranges_df.columns:
-            strand_col = ranges_df["strand"].astype(str).to_numpy()
+            strand_col = _series_to_py_str_array(ranges_df["strand"])
         else:
             strand_col = np.full(ranges_df.shape[0], "+", dtype=object)
 

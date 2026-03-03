@@ -15,6 +15,20 @@ try:
 except:
     print('no sparse')
 
+
+def _as_py_str_array(values) -> np.ndarray:
+    """Return a 1D object array of Python str, robust to NumPy StringDType."""
+    arr = np.asarray(values)
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    return np.array(
+        [
+            x.decode("utf-8") if isinstance(x, (bytes, bytearray)) else str(x)
+            for x in arr.tolist()
+        ],
+        dtype=object,
+    )
+
 # ——————————————————————————————————————————————————————————
 # low-level utilities
 # ——————————————————————————————————————————————————————————
@@ -69,16 +83,16 @@ def grandata_from_bigwigs(
     # 2) filter peaks to those chroms
     peaks = region_table.query("chrom in @chroms").reset_index(drop=True)
     peaks["region"] = (
-        peaks.chrom.astype(str)
+        peaks.chrom.map(str)
         + ":"
-        + peaks.start.astype(int).astype(str)
+        + peaks.start.astype(int).map(str)
         + "-"
-        + peaks.end.astype(int).astype(str)
+        + peaks.end.astype(int).map(str)
     )
 
     # 3) build obs- and var- coordinate arrays
-    obs_idx = [p.stem.replace(".", "_") for p in bw_files]
-    var_idx = peaks.region.values
+    obs_idx = np.array([p.stem.replace(".", "_") for p in bw_files], dtype=object)
+    var_idx = _as_py_str_array(peaks["region"])
 
     extra = {}
     extra[f"{obs_dim}-_-index"] = xr.DataArray(obs_idx, dims=[obs_dim])
@@ -86,10 +100,8 @@ def grandata_from_bigwigs(
 
     # var‐metadata too
     for col in ("chrom","start","end","region"):
-        extra[f"{var_dim}-_-{col}"] = (
-            xr.DataArray(peaks[col].values, dims=[var_dim])
-              .chunk({var_dim: chunk_size})
-        )
+        vals = _as_py_str_array(peaks[col]) if col in ("chrom", "region") else peaks[col].to_numpy()
+        extra[f"{var_dim}-_-{col}"] = xr.DataArray(vals, dims=[var_dim]).chunk({var_dim: chunk_size})
 
     adata = GRAnData(**extra)
     adata.attrs['chunk_size'] = chunk_size
@@ -173,23 +185,22 @@ def grandata_from_bigwigs_dask(
 
     peaks = region_table.query("chrom in @chroms").reset_index(drop=True)
     peaks["region"] = (
-        peaks.chrom.astype(str)
+        peaks.chrom.map(str)
         + ":"
-        + peaks.start.astype(int).astype(str)
+        + peaks.start.astype(int).map(str)
         + "-"
-        + peaks.end.astype(int).astype(str)
+        + peaks.end.astype(int).map(str)
     )
 
-    obs_idx = [p.stem.replace(".", "_") for p in bw_files]
-    var_idx = peaks.region.values
+    obs_idx = np.array([p.stem.replace(".", "_") for p in bw_files], dtype=object)
+    var_idx = _as_py_str_array(peaks["region"])
 
     extra = {}
     extra[f"{obs_dim}-_-index"] = xr.DataArray(obs_idx, dims=[obs_dim])
     extra[f"{var_dim}-_-index"] = xr.DataArray(var_idx, dims=[var_dim])
     for col in ("chrom", "start", "end", "region"):
-        extra[f"{var_dim}-_-{col}"] = (
-            xr.DataArray(peaks[col].values, dims=[var_dim]).chunk({var_dim: chunk_size})
-        )
+        vals = _as_py_str_array(peaks[col]) if col in ("chrom", "region") else peaks[col].to_numpy()
+        extra[f"{var_dim}-_-{col}"] = xr.DataArray(vals, dims=[var_dim]).chunk({var_dim: chunk_size})
 
     adata = GRAnData(**extra)
     adata.attrs["chunk_size"] = chunk_size
@@ -208,7 +219,7 @@ def grandata_from_bigwigs_dask(
     starts = (peaks.start - half).clip(lower=0)
     ends = starts + target_region_width
     intervals = list(
-        zip(peaks.chrom.astype(str), starts.astype(int), ends.astype(int))
+        zip(peaks.chrom.map(str), starts.astype(int), ends.astype(int))
     )
 
     n_obs = len(obs_idx)
@@ -368,7 +379,7 @@ def add_bigwig_array_dask(
     n_obs = len(adata[f"{obs_dim}-_-index"].values)
     n_var = len(region_table)
 
-    obs_names = adata[f"{obs_dim}-_-index"].values.astype(str).tolist()
+    obs_names = _as_py_str_array(adata[f"{obs_dim}-_-index"].values).tolist()
     file_map = {p.stem.replace(".", "_"): p for p in bw_files}
     bw_paths = [file_map.get(name) for name in obs_names]
 
@@ -380,7 +391,7 @@ def add_bigwig_array_dask(
     starts = (region_table.start - half).clip(lower=0)
     ends = starts + target_region_width
     intervals = list(
-        zip(region_table.chrom.astype(str), starts.astype(int), ends.astype(int))
+        zip(region_table.chrom.map(str), starts.astype(int), ends.astype(int))
     )
 
     def _load_block(_block, block_info=None):
@@ -406,9 +417,9 @@ def add_bigwig_array_dask(
     )
     data = da.map_blocks(_load_block, template, dtype="float32")
 
-    obs_labels = adata[f"{obs_dim}-_-index"].values.astype(str)
+    obs_labels = _as_py_str_array(adata[f"{obs_dim}-_-index"].values)
     if f"{var_dim}-_-index" in adata:
-        var_labels = adata[f"{var_dim}-_-index"].values.astype(str)
+        var_labels = _as_py_str_array(adata[f"{var_dim}-_-index"].values)
     else:
         var_labels = np.arange(n_var)
 
@@ -425,16 +436,16 @@ def add_bigwig_array_dask(
     # Align to the existing store dims to avoid size-mismatch errors when adata is a subset.
     store_ds = xr.open_zarr(adata.encoding["source"], consolidated=False)
     if f"{obs_dim}-_-index" in store_ds:
-        store_obs = store_ds[f"{obs_dim}-_-index"].values.astype(str)
+        store_obs = _as_py_str_array(store_ds[f"{obs_dim}-_-index"].values)
     elif obs_dim in store_ds.coords:
-        store_obs = store_ds.coords[obs_dim].values
+        store_obs = _as_py_str_array(store_ds.coords[obs_dim].values)
     else:
         store_obs = np.arange(store_ds.sizes.get(obs_dim, len(obs_labels)))
 
     if f"{var_dim}-_-index" in store_ds:
-        store_var = store_ds[f"{var_dim}-_-index"].values.astype(str)
+        store_var = _as_py_str_array(store_ds[f"{var_dim}-_-index"].values)
     elif var_dim in store_ds.coords:
-        store_var = store_ds.coords[var_dim].values
+        store_var = _as_py_str_array(store_ds.coords[var_dim].values)
     else:
         store_var = np.arange(store_ds.sizes.get(var_dim, n_var))
 
@@ -489,7 +500,7 @@ def prepare_intervals(
     idx_col   = f"{var_dim}-_-{index_suffix}"
 
     df = pd.DataFrame({
-        "chrom": adata[chrom_col].values.astype(str),
+        "chrom": _as_py_str_array(adata[chrom_col].values),
         "start": adata[start_col].values.astype(int),
         "end":   adata[end_col].values.astype(int),
     }, index=adata[idx_col].values)
@@ -578,7 +589,7 @@ def add_contact_strengths_to_varp(
     n_var       = adata.sizes[var_dim]
     bedp_list   = list(map(Path, bedp_files))
     n_obs       = len(bedp_list)
-    var_index   = adata[f"{var_dim}-_-{index_suffix}"].values.astype(str)
+    var_index   = _as_py_str_array(adata[f"{var_dim}-_-{index_suffix}"].values)
     var_to_idx  = {v:i for i,v in enumerate(var_index)}
 
     rows = []
