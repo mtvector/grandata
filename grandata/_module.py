@@ -598,11 +598,19 @@ def _apply_dnatransform_array(arr: np.ndarray, dims: tuple[str, ...], rc_flags, 
     arr = np.moveaxis(arr, var_axis, 0)
     rc_idx = np.flatnonzero(rc_flags)
     if len(rc_idx):
-        seq_axis_adj = seq_axis - (1 if seq_axis > var_axis else 0)
-        nuc_axis_adj = nuc_axis - (1 if nuc_axis > var_axis else 0)
+        seq_axis_adj = _axis_after_move_to_front(seq_axis, var_axis)
+        nuc_axis_adj = _axis_after_move_to_front(nuc_axis, var_axis)
         arr[rc_idx] = np.flip(arr[rc_idx], axis=(seq_axis_adj, nuc_axis_adj))
     arr = np.moveaxis(arr, 0, var_axis)
     return arr
+
+
+def _axis_after_move_to_front(axis: int, moved_axis: int) -> int:
+    if axis == moved_axis:
+        return 0
+    if axis < moved_axis:
+        return axis + 1
+    return axis
 
 
 def make_stateful_transform(fn, apply_states=("train", "val", "test", "predict")):
@@ -630,11 +638,120 @@ def make_rc_signflip_transform(
     flip_keys: list[str],
     dnatransform,
     batch_dim: str = "var",
+    target_seq_dims: dict[str, str] | None = None,
+    shift_keys: list[str] | None = None,
 ):
     """
-    Create a batch transform that applies a DNATransform to sequences and flips
-    the sign of selected outputs when reverse complemented.
+    Create a stateful batch transform that applies DNATransform to sequence input
+    and applies paired target transforms for reverse-complemented samples.
+
+    This compatibility helper now applies three operations to ``flip_keys``:
+    - sequence-axis window alignment (if key is in ``shift_keys``),
+    - sequence-axis reversal on RC,
+    - sign flip on RC.
+
+    For finer control (e.g. ATAC reverse-only and RNA reverse+sign), use
+    ``make_paired_dna_target_transform`` directly.
     """
+    target_configs = {}
+    for key in flip_keys:
+        target_configs[key] = {
+            "seq_dim": (target_seq_dims or {}).get(key),
+            "apply_window": True if shift_keys is None else key in set(shift_keys),
+            "reverse_on_rc": True,
+            "sign_flip_on_rc": True,
+        }
+    return make_paired_dna_target_transform(
+        seq_key=seq_key,
+        dnatransform=dnatransform,
+        target_configs=target_configs,
+        batch_dim=batch_dim,
+    )
+
+
+def _project_window_indices(start: int, end: int, src_len: int, dst_len: int) -> tuple[int, int]:
+    if dst_len <= 0:
+        return 0, 0
+    if src_len <= 0:
+        return 0, dst_len
+    win_len = max(1, int(round((end - start) * float(dst_len) / float(src_len))))
+    win_len = min(win_len, dst_len)
+    center = ((start + end) / 2.0) * (float(dst_len) / float(src_len))
+    dst_start = int(round(center - (win_len / 2.0)))
+    dst_start = max(0, min(dst_len - win_len, dst_start))
+    dst_end = dst_start + win_len
+    return dst_start, dst_end
+
+
+def _apply_target_transform_array(
+    arr: np.ndarray,
+    dims: tuple[str, ...],
+    *,
+    batch_dim: str,
+    seq_dim: str | None,
+    rc_flags: np.ndarray,
+    src_start: int,
+    src_end: int,
+    src_seq_len: int,
+    apply_window: bool,
+    reverse_on_rc: bool,
+    sign_flip_on_rc: bool,
+) -> np.ndarray:
+    out = arr
+    if apply_window and seq_dim and seq_dim in dims:
+        seq_axis = dims.index(seq_dim)
+        dst_start, dst_end = _project_window_indices(src_start, src_end, src_seq_len, out.shape[seq_axis])
+        out = np.take(out, np.arange(dst_start, dst_end), axis=seq_axis)
+    if not np.any(rc_flags):
+        return out
+    if batch_dim not in dims:
+        return out
+    if not reverse_on_rc and not sign_flip_on_rc:
+        return out
+
+    batch_axis = dims.index(batch_dim)
+    out = np.moveaxis(out, batch_axis, 0)
+    rc_idx = np.flatnonzero(rc_flags)
+    transformed = out[rc_idx]
+
+    if reverse_on_rc and seq_dim and seq_dim in dims:
+        seq_axis = dims.index(seq_dim)
+        seq_axis_adj = _axis_after_move_to_front(seq_axis, batch_axis)
+        transformed = np.flip(transformed, axis=seq_axis_adj)
+    if sign_flip_on_rc:
+        transformed = -transformed
+    out[rc_idx] = transformed
+    out = np.moveaxis(out, 0, batch_axis)
+    return out
+
+
+def make_paired_dna_target_transform(
+    seq_key: str,
+    dnatransform,
+    target_configs: dict[str, dict] | None = None,
+    batch_dim: str = "var",
+):
+    """
+    Create a batch transform that applies a shared random DNA crop/RC to the
+    sequence key and paired target transforms to selected output keys.
+
+    Parameters
+    ----------
+    seq_key
+        Batch key for one-hot sequence input.
+    dnatransform
+        ``grandata.seq_io.DNATransform`` instance.
+    target_configs
+        Mapping from output key to config dict with optional fields:
+        - ``seq_dim``: str | None (default: infer ``seq_bins`` if present)
+        - ``apply_window``: bool (default: True when ``seq_dim`` exists)
+        - ``reverse_on_rc``: bool (default: False)
+        - ``sign_flip_on_rc``: bool (default: False)
+    batch_dim
+        Name of sample axis shared with sequence ``var`` axis.
+    """
+    target_configs = target_configs or {}
+
     def _transform(batch: dict, dims_map: dict[str, tuple[str, ...]], state: str | None = None):
         if state is not None and dnatransform.apply_states and state not in dnatransform.apply_states:
             return batch
@@ -647,6 +764,7 @@ def make_rc_signflip_transform(
         var_axis = dims.index(var_name)
         seq_axis = dims.index(seq_name)
         arr = batch[seq_key]
+        seq_len_in = arr.shape[seq_axis]
         shift = 0
         if dnatransform.max_shift_param:
             shift = np.random.randint(-dnatransform.max_shift_param, dnatransform.max_shift_param + 1)
@@ -655,19 +773,30 @@ def make_rc_signflip_transform(
         if dnatransform.random_rc and (state is None or not dnatransform.rc_states or state in dnatransform.rc_states):
             rc_flags = np.random.rand(arr.shape[var_axis]) < 0.5
         batch[seq_key] = _apply_dnatransform_array(arr, dims, rc_flags, start, end, dnatransform)
-        if not np.any(rc_flags):
-            return batch
-        rc_idx = np.flatnonzero(rc_flags)
-        for key in flip_keys:
+
+        for key, cfg in target_configs.items():
             if key not in batch or key not in dims_map:
                 continue
             key_dims = dims_map[key]
-            if batch_dim not in key_dims:
-                continue
-            axis = key_dims.index(batch_dim)
-            arr_key = np.moveaxis(batch[key], axis, 0)
-            arr_key[rc_idx] *= -1
-            batch[key] = np.moveaxis(arr_key, 0, axis)
+            seq_dim = cfg.get("seq_dim")
+            if seq_dim is None and "seq_bins" in key_dims:
+                seq_dim = "seq_bins"
+            apply_window = cfg.get("apply_window", bool(seq_dim and seq_dim in key_dims))
+            reverse_on_rc = cfg.get("reverse_on_rc", False)
+            sign_flip_on_rc = cfg.get("sign_flip_on_rc", False)
+            batch[key] = _apply_target_transform_array(
+                batch[key],
+                key_dims,
+                batch_dim=batch_dim,
+                seq_dim=seq_dim,
+                rc_flags=rc_flags,
+                src_start=start,
+                src_end=end,
+                src_seq_len=seq_len_in,
+                apply_window=apply_window,
+                reverse_on_rc=reverse_on_rc,
+                sign_flip_on_rc=sign_flip_on_rc,
+            )
         return batch
 
     _transform._stateful = True
