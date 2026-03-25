@@ -2,9 +2,9 @@
 
 These guides cover the main package workflows:
 
-- [Single- and Multi-Species Data Preparation](/src/grandata/docs/guides/data-preparation/single-and-multi-species.md)
-- [RNA and Extra Modalities](/src/grandata/docs/guides/data-preparation/rna-and-extra-modalities.md)
-- [Loading Pre-Built `GRAnData` Zarr Stores](/src/grandata/docs/guides/loading/prebuilt-grandata-zarr.md)
+- [Single- and Multi-Species Data Preparation](guides/data-preparation/single-and-multi-species.md)
+- [RNA and Extra Modalities](guides/data-preparation/rna-and-extra-modalities.md)
+- [Loading Pre-Built `GRAnData` Zarr Stores](guides/loading/prebuilt-grandata-zarr.md)
 
 Current scope:
 

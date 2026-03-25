@@ -12,11 +12,11 @@ Supports reading bigwigs, fasta, h5 via chrom_io, seq_io and tx_io to create GRA
 
 # Docs
 
-Practical usage guides live in [`docs/README.md`](/src/grandata/docs/README.md):
+Practical usage guides live in [`docs/README.md`](docs/README.md):
 
-- [Single- and Multi-Species Data Preparation](/src/grandata/docs/guides/data-preparation/single-and-multi-species.md)
-- [RNA and Extra Modalities](/src/grandata/docs/guides/data-preparation/rna-and-extra-modalities.md)
-- [Loading Pre-Built `GRAnData` Zarr Stores](/src/grandata/docs/guides/loading/prebuilt-grandata-zarr.md)
+- [Single- and Multi-Species Data Preparation](docs/guides/data-preparation/single-and-multi-species.md)
+- [RNA and Extra Modalities](docs/guides/data-preparation/rna-and-extra-modalities.md)
+- [Loading Pre-Built `GRAnData` Zarr Stores](docs/guides/loading/prebuilt-grandata-zarr.md)
 
 # Installation
 
