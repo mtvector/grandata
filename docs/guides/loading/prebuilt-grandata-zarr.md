@@ -186,6 +186,57 @@ For multiple stores:
 - `weights` controls dataset-level sampling frequency
 - `join` controls coordinate alignment on non-batch dimensions
 
+## Merge multiple stores into one flat backed store
+
+If you want a single mixed store instead of dataset-level sampling across multiple stores, use `concat_grandata(...)`.
+
+This concatenates multiple `GRAnData` objects along one dimension, optionally adds a per-input label such as species identity, optionally shuffles that same dimension, writes a new zarr store, and returns the reopened backed merged object.
+
+```python
+from grandata import GRAnData, concat_grandata
+
+human = GRAnData.open_zarr("/data/human.zarr", consolidated=False)
+mouse = GRAnData.open_zarr("/data/mouse.zarr", consolidated=False)
+
+merged = concat_grandata(
+    [human, mouse],
+    out_path="/data/merged.zarr",
+    concat_dim="var",
+    join="outer",
+    add_key="var-_-species",
+    add_values=["human", "mouse"],
+    shuffle=True,
+    random_state=42,
+)
+```
+
+Typical uses:
+
+- merge species-specific stores into one flat `var` axis
+- preserve source identity with `add_key`
+- use `join="outer"` to keep the union of non-concatenated coordinates
+- use `join="inner"` to keep only the shared intersection
+
+After merging, load the new store exactly like any other backed `GRAnData` object:
+
+```python
+from grandata import GRAnDataModule
+
+module = GRAnDataModule(
+    adatas=merged,
+    batch_size=32,
+    load_keys={
+        "X": "signal",
+        "sequences": "sequence",
+        "var-_-species": "species",
+    },
+    batch_dim="var",
+)
+
+module.setup("train")
+batch = next(iter(module.train_dataloader))
+```
+
 ## Output batch structure
 
 `GRAnDataModule` returns dictionaries keyed by the output names from `load_keys`.

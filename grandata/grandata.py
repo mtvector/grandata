@@ -4,6 +4,7 @@ import numpy as np
 import os
 import json
 import zarr
+from collections.abc import Sequence
 
 try:
     import sparse  # for sparse multidimensional arrays
@@ -163,3 +164,90 @@ class GRAnData(xr.Dataset):
         for k in new_self.keys():
             new_self[k] = new_self[k].chunk({k:new_self.chunks[k] for k in new_self[k].dims})
         new_self.to_zarr(out_path,mode='w')
+
+
+def concat_grandata(
+    adatas: Sequence[GRAnData],
+    out_path,
+    concat_dim: str = "var",
+    join: str = "outer",
+    add_key: str | None = None,
+    add_values: Sequence[object] | None = None,
+    shuffle: bool = False,
+    random_state: int | None = None,
+    consolidated: bool = False,
+    mode: str = "w",
+    **to_zarr_kwargs,
+) -> GRAnData:
+    """
+    Concatenate one or more GRAnData objects, optionally annotate the concatenated
+    axis with per-input labels, optionally shuffle that axis, write the merged
+    zarr store, and reopen it as a backed GRAnData object.
+
+    Parameters
+    ----------
+    adatas
+        Input GRAnData objects. These may be backed objects from ``GRAnData.open_zarr``.
+    out_path
+        Output zarr store path.
+    concat_dim
+        Dimension along which to concatenate, e.g. ``"var"``.
+    join
+        Xarray alignment mode for non-concatenated dimensions. Must be ``"inner"``
+        or ``"outer"``.
+    add_key
+        Optional variable name to add along ``concat_dim`` with one constant value
+        per input dataset, e.g. ``"var-_-species"``.
+    add_values
+        Per-input values used for ``add_key``. Required when ``add_key`` is set.
+    shuffle
+        If True, shuffle the concatenated axis before writing.
+    random_state
+        Optional seed used when ``shuffle=True``.
+    consolidated
+        Passed through to the reopened ``GRAnData.open_zarr`` call.
+    mode
+        Write mode passed to ``to_zarr``.
+    **to_zarr_kwargs
+        Additional keyword arguments forwarded to ``to_zarr``.
+
+    Returns
+    -------
+    GRAnData
+        Reopened merged object backed by the written zarr store.
+    """
+    if not adatas:
+        raise ValueError("adatas must contain at least one GRAnData object.")
+    if join not in ("inner", "outer"):
+        raise ValueError("join must be 'inner' or 'outer'.")
+    if add_key is None and add_values is not None:
+        raise ValueError("add_values may only be provided when add_key is set.")
+    if add_key is not None:
+        if add_values is None:
+            raise ValueError("add_values is required when add_key is set.")
+        if len(add_values) != len(adatas):
+            raise ValueError("add_values must match the number of input GRAnData objects.")
+
+    prepared = []
+    for idx, adata in enumerate(adatas):
+        if concat_dim not in adata.dims:
+            raise ValueError(f"concat_dim {concat_dim!r} not found in input dataset {idx}.")
+
+        ds = adata.copy()
+        if add_key is not None:
+            label = np.full(adata.sizes[concat_dim], add_values[idx], dtype=object)
+            ds[add_key] = xr.DataArray(label, dims=(concat_dim,), coords={concat_dim: adata.coords[concat_dim]})
+        prepared.append(ds)
+
+    merged = xr.concat(prepared, dim=concat_dim, join=join)
+
+    if shuffle:
+        rng = np.random.default_rng(random_state)
+        permutation = rng.permutation(merged.sizes[concat_dim])
+        merged = merged.isel({concat_dim: permutation})
+
+    merged_attrs = dict(merged.attrs)
+    merged = GRAnData(data_vars=merged.data_vars, coords=merged.coords)
+    merged.attrs = merged_attrs
+    merged.to_zarr(store=out_path, mode=mode, **to_zarr_kwargs)
+    return GRAnData.open_zarr(out_path, consolidated=consolidated)

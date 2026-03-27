@@ -297,6 +297,8 @@ For multi-species loading:
 3. Open all stores as `GRAnData`
 4. Pass the list of stores to `GRAnDataModule`
 
+If you prefer one flat mixed-species store instead, you can also merge multiple backed stores with `concat_grandata(...)`; see the loading guide for the full example in [`docs/guides/loading/prebuilt-grandata-zarr.md`](../loading/prebuilt-grandata-zarr.md).
+
 ### 1. Build one store per species
 
 For example:

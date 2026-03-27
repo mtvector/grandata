@@ -1,4 +1,4 @@
-from .grandata import GRAnData
+from .grandata import GRAnData, concat_grandata
 from ._genome import Genome
 from ._bin_genome import bin_genome
 from ._module import (
