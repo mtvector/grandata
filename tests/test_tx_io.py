@@ -1,8 +1,11 @@
-import numpy as np
+from pathlib import Path
+
 import h5py
+import numpy as np
+import xarray as xr
 from scipy.sparse import csr_matrix
 
-from grandata import tx_io
+from grandata import GRAnData, tx_io
 
 
 def _write_minimal_h5ad(path):
@@ -61,3 +64,51 @@ def test_read_h5ad_selective_and_group_aggr_mean(tmp_path):
         assert np.allclose(got, expected)
     finally:
         tx_io.close_h5_backing(ds)
+
+
+def test_add_gtf_annotation_masks_paints_gene_body_and_tss_support(tmp_path: Path) -> None:
+    gtf_path = tmp_path / "genes.gtf"
+    gtf_path.write_text(
+        "chr1\ttest\tgene\t20\t40\t.\t+\t.\tgene_name \"GeneA\";\n"
+        "chr1\ttest\tgene\t70\t90\t.\t-\t.\tgene_name \"GeneB\";\n"
+        "chr1\ttest\tgene\t45\t55\t.\t+\t.\tgene_name \"NotInRNA\";\n"
+    )
+    ds = GRAnData(
+        data_vars={
+            "var-_-chrom": xr.DataArray(np.array(["chr1", "chr1"]), dims=("var",)),
+            "var-_-start": xr.DataArray(np.array([0, 50]), dims=("var",)),
+            "var-_-end": xr.DataArray(np.array([50, 100]), dims=("var",)),
+        },
+        coords={"var": np.arange(2), "seq_bins": np.arange(10)},
+    )
+    store_path = tmp_path / "annotation_masks.zarr"
+    ds.to_zarr(store_path)
+    backed = GRAnData.open_zarr(store_path, consolidated=False)
+
+    result = tx_io.add_gtf_annotation_masks(
+        backed,
+        gtf_file=gtf_path,
+        gene_names=["GeneA", "GeneB"],
+        tss_projection_bases=10,
+        chunk_size=1,
+    )
+
+    expected_body = np.array([
+        [False, False, False, False, True, True, True, True, False, False],
+        [False, False, False, False, True, True, True, True, False, False],
+    ])
+    expected_locus = np.array([
+        [False, False, False, False, True, True, False, False, False, False],
+        [False, False, False, False, False, False, False, False, True, True],
+    ])
+    np.testing.assert_array_equal(result["gene_body_mask"].values, expected_body)
+    np.testing.assert_array_equal(result["rna_locus_mask"].values, expected_locus)
+    np.testing.assert_array_equal(
+        result["rna_forward_locus_mask"].values,
+        np.vstack([expected_locus[0], np.zeros(10, dtype=bool)]),
+    )
+    np.testing.assert_array_equal(
+        result["rna_reverse_locus_mask"].values,
+        np.vstack([np.zeros(10, dtype=bool), expected_locus[1]]),
+    )
+    assert result["rna_locus_mask"].attrs["annotation_kind"] == "tx_io_tss_projection"

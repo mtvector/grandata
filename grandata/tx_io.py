@@ -1,4 +1,5 @@
 import h5py
+import gzip
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -9,7 +10,7 @@ from scipy.sparse import csr_matrix
 from pathlib import Path
 from itertools import product
 import re
-from typing import Union, Literal, List, Tuple, Dict
+from typing import Union, Literal, List, Tuple, Dict, Iterator, Mapping, Sequence
 import dask.array as da
 import weakref
 
@@ -63,6 +64,213 @@ def read_gtf(gtf: str) -> pd.DataFrame:
     df["end"] = df["end"].astype(int)
 
     return df
+
+
+def _iter_matched_gene_intervals(
+    *,
+    gtf_file: str | Path,
+    gene_names: set[str],
+    gtf_gene_field: str,
+    gene_replace_dict: Mapping[str, str] | None,
+    tss_projection_bases: int,
+) -> Iterator[tuple[str, int, int, int, int, str]]:
+    """Yield matched GTF gene bodies and their tx_io TSS projection intervals."""
+    pattern = re.compile(rf'(?:^|;\s*){re.escape(gtf_gene_field)}\s+"([^"]+)"')
+    path = Path(gtf_file)
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt") as handle:
+        for line in handle:
+            if line.startswith("#"):
+                continue
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) != 9 or fields[2] != "gene":
+                continue
+            match = pattern.search(fields[8])
+            if match is None:
+                continue
+            gene_name = match.group(1)
+            if gene_replace_dict is not None:
+                gene_name = gene_replace_dict.get(gene_name, gene_name)
+            if gene_name not in gene_names:
+                continue
+            chrom = fields[0]
+            body_start = int(fields[3])
+            body_end = int(fields[4])
+            tss = body_start if fields[6] == "+" else body_end
+            yield chrom, body_start, body_end, tss, tss + tss_projection_bases, fields[6]
+
+
+def _paint_interval_mask(
+    *,
+    chroms: np.ndarray,
+    region_starts: np.ndarray,
+    region_ends: np.ndarray,
+    intervals_by_chrom: Mapping[str, Sequence[tuple[int, int]]],
+    n_bins: int,
+) -> np.ndarray:
+    """Paint interval overlaps into a boolean region-by-bin matrix."""
+    mask = np.zeros((len(chroms), n_bins), dtype=bool)
+    sorted_intervals: dict[str, tuple[np.ndarray, np.ndarray, int]] = {}
+    for chrom, intervals in intervals_by_chrom.items():
+        values = np.asarray(sorted(intervals), dtype=np.int64)
+        if values.size:
+            starts = values[:, 0]
+            ends = values[:, 1]
+            sorted_intervals[chrom] = (starts, ends, int(np.max(ends - starts)))
+
+    for region_index, (chrom, region_start, region_end) in enumerate(
+        zip(chroms.astype(str), region_starts, region_ends)
+    ):
+        indexed = sorted_intervals.get(chrom)
+        width = int(region_end) - int(region_start)
+        if indexed is None or width <= 0:
+            continue
+        starts, ends, max_span = indexed
+        candidate_start = int(
+            np.searchsorted(starts, int(region_start) - max_span, side="right")
+        )
+        candidate_end = int(np.searchsorted(starts, int(region_end), side="left"))
+        for interval_start, interval_end in zip(
+            starts[candidate_start:candidate_end], ends[candidate_start:candidate_end]
+        ):
+            if int(interval_end) <= int(region_start):
+                continue
+            overlap_start = max(int(interval_start), int(region_start))
+            overlap_end = min(int(interval_end), int(region_end))
+            left = max(0, (overlap_start - int(region_start)) * n_bins // width)
+            right = min(
+                n_bins,
+                ((overlap_end - int(region_start)) * n_bins + width - 1) // width,
+            )
+            if right > left:
+                mask[region_index, left:right] = True
+    return mask
+
+
+def add_gtf_annotation_masks(
+    adata: GRAnData,
+    *,
+    gtf_file: str | Path,
+    gene_names: Sequence[str],
+    gtf_gene_field: str = "gene_name",
+    gene_replace_dict: Mapping[str, str] | None = None,
+    tss_projection_bases: int = 1000,
+    var_dim: str = "var",
+    seq_dim: str = "seq_bins",
+    gene_body_array_name: str = "gene_body_mask",
+    rna_locus_array_name: str = "rna_locus_mask",
+    rna_forward_locus_array_name: str = "rna_forward_locus_mask",
+    rna_reverse_locus_array_name: str = "rna_reverse_locus_mask",
+    chunk_size: int = 128,
+) -> GRAnData:
+    """Add matched GTF gene-body and tx_io TSS-support masks to a GRAnData store.
+
+    Coordinates intentionally follow ``write_tss_bigwigs``: GTF integer positions
+    are used directly, and each RNA locus is ``[TSS, TSS + tss_projection_bases)``.
+    Only genes represented by ``gene_names`` are painted. Never use the gene-body
+    mask as the structural support of an RNA track; use ``rna_locus_array_name``.
+    """
+    if tss_projection_bases < 1:
+        raise ValueError("tss_projection_bases must be positive")
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be positive")
+    for key in (f"{var_dim}-_-chrom", f"{var_dim}-_-start", f"{var_dim}-_-end"):
+        if key not in adata:
+            raise KeyError(f"GRAnData is missing required interval field: {key}")
+    if seq_dim not in adata.sizes:
+        raise KeyError(f"GRAnData is missing sequence dimension: {seq_dim}")
+
+    matched = list(_iter_matched_gene_intervals(
+        gtf_file=gtf_file,
+        gene_names=set(map(str, gene_names)),
+        gtf_gene_field=gtf_gene_field,
+        gene_replace_dict=gene_replace_dict,
+        tss_projection_bases=tss_projection_bases,
+    ))
+    body_intervals: dict[str, list[tuple[int, int]]] = {}
+    locus_intervals: dict[str, list[tuple[int, int]]] = {}
+    forward_locus_intervals: dict[str, list[tuple[int, int]]] = {}
+    reverse_locus_intervals: dict[str, list[tuple[int, int]]] = {}
+    for chrom, body_start, body_end, locus_start, locus_end, strand in matched:
+        body_intervals.setdefault(chrom, []).append((body_start, body_end))
+        locus_intervals.setdefault(chrom, []).append((locus_start, locus_end))
+        strand_intervals = forward_locus_intervals if strand == "+" else reverse_locus_intervals
+        strand_intervals.setdefault(chrom, []).append((locus_start, locus_end))
+
+    raw_chroms = np.asarray(adata[f"{var_dim}-_-chrom"].values)
+    chroms = np.asarray([
+        value.decode("utf-8") if isinstance(value, (bytes, bytearray)) else str(value)
+        for value in raw_chroms.tolist()
+    ], dtype=object)
+    region_starts = np.asarray(adata[f"{var_dim}-_-start"].values, dtype=np.int64)
+    region_ends = np.asarray(adata[f"{var_dim}-_-end"].values, dtype=np.int64)
+    n_bins = int(adata.sizes[seq_dim])
+    gene_body_mask = _paint_interval_mask(
+        chroms=chroms,
+        region_starts=region_starts,
+        region_ends=region_ends,
+        intervals_by_chrom=body_intervals,
+        n_bins=n_bins,
+    )
+    rna_locus_mask = _paint_interval_mask(
+        chroms=chroms,
+        region_starts=region_starts,
+        region_ends=region_ends,
+        intervals_by_chrom=locus_intervals,
+        n_bins=n_bins,
+    )
+    rna_forward_locus_mask = _paint_interval_mask(
+        chroms=chroms,
+        region_starts=region_starts,
+        region_ends=region_ends,
+        intervals_by_chrom=forward_locus_intervals,
+        n_bins=n_bins,
+    )
+    rna_reverse_locus_mask = _paint_interval_mask(
+        chroms=chroms,
+        region_starts=region_starts,
+        region_ends=region_ends,
+        intervals_by_chrom=reverse_locus_intervals,
+        n_bins=n_bins,
+    )
+    provenance = {
+        "gtf_file": str(gtf_file),
+        "gtf_gene_field": gtf_gene_field,
+        "matched_gene_count": len(matched),
+        "tss_projection_bases": tss_projection_bases,
+    }
+    dataset = xr.Dataset({
+        gene_body_array_name: xr.DataArray(
+            da.from_array(gene_body_mask, chunks=(chunk_size, n_bins)),
+            dims=(var_dim, seq_dim),
+            attrs={**provenance, "annotation_kind": "outer_gene_range"},
+        ),
+        rna_locus_array_name: xr.DataArray(
+            da.from_array(rna_locus_mask, chunks=(chunk_size, n_bins)),
+            dims=(var_dim, seq_dim),
+            attrs={**provenance, "annotation_kind": "tx_io_tss_projection"},
+        ),
+        rna_forward_locus_array_name: xr.DataArray(
+            da.from_array(rna_forward_locus_mask, chunks=(chunk_size, n_bins)),
+            dims=(var_dim, seq_dim),
+            attrs={**provenance, "annotation_kind": "tx_io_forward_tss_projection"},
+        ),
+        rna_reverse_locus_array_name: xr.DataArray(
+            da.from_array(rna_reverse_locus_mask, chunks=(chunk_size, n_bins)),
+            dims=(var_dim, seq_dim),
+            attrs={**provenance, "annotation_kind": "tx_io_reverse_tss_projection"},
+        ),
+    })
+    source = getattr(adata, "encoding", {}).get("source")
+    if source is None:
+        result = adata.copy()
+        result[gene_body_array_name] = dataset[gene_body_array_name]
+        result[rna_locus_array_name] = dataset[rna_locus_array_name]
+        result[rna_forward_locus_array_name] = dataset[rna_forward_locus_array_name]
+        result[rna_reverse_locus_array_name] = dataset[rna_reverse_locus_array_name]
+        return result
+    dataset.to_zarr(source, mode="a")
+    return GRAnData.open_zarr(source, consolidated=False)
 
 def read_h5ad_selective_to_grandata(
     filename: Union[str, Path],
