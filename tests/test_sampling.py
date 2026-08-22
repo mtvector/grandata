@@ -84,3 +84,59 @@ def test_weighted_sampling_meta_module(tmp_path):
 
     frac_a = count_a / n_batches
     assert frac_a >= 0.7
+
+
+def test_chunk_local_weighted_sampling_preserves_marginals(tmp_path):
+    np.random.seed(0)
+    adata = _build_weighted_dataset(tmp_path, value_offset=0.0, n_var=8)
+    weights = np.array([0.7, 0.1, 0.05, 0.05, 0.025, 0.025, 0.025, 0.025])
+    module = GRAnDataModule(
+        adatas=adata,
+        batch_size=4,
+        load_keys={"X": "X"},
+        sample_weights=weights,
+        sample_weight_chunk_size=4,
+    )
+    module.setup("train")
+
+    counts = np.zeros(8, dtype=int)
+    for batch_index, batch in enumerate(module.train_dataloader):
+        values = np.asarray(batch["X"]).reshape(-1).astype(int)
+        assert np.unique(values // 4).size == 1
+        counts += np.bincount(values, minlength=8)
+        if batch_index + 1 >= 2000:
+            break
+
+    observed = counts / counts.sum()
+    expected = weights / weights.sum()
+    assert np.allclose(observed, expected, atol=0.03)
+
+
+def test_seeded_weighted_sampling_is_prefetch_deterministic(tmp_path):
+    adata = _build_weighted_dataset(tmp_path, value_offset=0.0, n_var=8)
+    weights = np.array([0.40, 0.20, 0.10, 0.10, 0.05, 0.05, 0.05, 0.05])
+
+    streams = []
+    for seed in (17, 17, 18):
+        module = GRAnDataModule(
+            adatas=adata,
+            batch_size=4,
+            load_keys={"X": "X"},
+            sample_weights=weights,
+            sample_weight_chunk_size=4,
+            prefetch_factor=3,
+            io_workers=2,
+            random_state=seed,
+        )
+        module.setup("train")
+        batches = []
+        for batch_index, batch in enumerate(module.train_dataloader):
+            batches.append(np.asarray(batch["X"]).reshape(-1).astype(int))
+            if batch_index + 1 >= 20:
+                break
+        streams.append(np.stack(batches))
+        np.random.seed(seed * 101)
+        np.random.random(1000)
+
+    assert np.array_equal(streams[0], streams[1])
+    assert not np.array_equal(streams[0], streams[2])

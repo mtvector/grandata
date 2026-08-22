@@ -177,6 +177,34 @@ def test_grandata_module_broadcasts_missing_batch_dim(monkeypatch, tmp_path):
     np.testing.assert_allclose(rna_means, expected)
 
 
+def test_grandata_module_can_keep_missing_batch_dim_shared(monkeypatch, tmp_path):
+    adata = _build_module_dataset_with_rna_means(tmp_path)
+
+    fixed_perm = np.array([2, 0, 1])
+    monkeypatch.setattr(np.random, "permutation", lambda n: fixed_perm)
+
+    module = GRAnDataModule(
+        adatas=adata,
+        batch_size=2,
+        load_keys={"X": "atac_tracks", "rna_means": "rna_means"},
+        in_memory_keys=["rna_means"],
+        shared_keys=["rna_means"],
+        emit_shuffle_indices=True,
+        shuffle_dims=["obs"],
+    )
+    module.setup("train")
+
+    assert isinstance(module._fast_configs[0]["arrays"]["rna_means"], np.ndarray)
+    batch = next(iter(module.train_dataloader))
+    assert batch["atac_tracks"].shape == (3, 2, 2)
+    assert batch["rna_means"].shape == (3, 2)
+    np.testing.assert_allclose(
+        batch["rna_means"],
+        np.array([[20, 21], [0, 1], [10, 11]], dtype=np.float32),
+    )
+    np.testing.assert_array_equal(batch["__shuffle_index__obs"], fixed_perm)
+
+
 def test_paired_transform_keeps_targets_aligned_under_shift_and_rc(monkeypatch):
     dnatransform = DNATransform(
         out_len=4,

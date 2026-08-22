@@ -599,9 +599,11 @@ def write_tss_bigwigs(
         gtf[gtf_gene_field] = [gene_replace_dict.get(x,x) for x in gtf[gtf_gene_field]]
     gtf = gtf.loc[~gtf[gtf_gene_field].isna()]
     
-    shared_var_names = list(
-        set(gtf[gtf_gene_field].unique()) & set(var_names)
-    )
+    gtf_gene_names = set(gtf[gtf_gene_field].unique())
+    # Preserve matrix column order. A set intersection here silently detached
+    # expression values from their genes because set iteration order is not the
+    # order of ``var_names``.
+    shared_var_names = [name for name in var_names if name in gtf_gene_names]
     gtf = gtf.loc[gtf[gtf_gene_field].isin(shared_var_names)]
     gtf = gtf.dropna(subset=["seqname", "start", "end", "strand", gtf_gene_field])
     
@@ -709,7 +711,7 @@ def write_tss_bigwigs(
 
         # 5) Write out the merged intervals to BigWig
         writer = pybigtools.open(str(path), mode='w')
-        pybigtools.BigWigWrite.write(writer, chroms=chromsizes, vals=merged_values)
+        writer.write(chroms=chromsizes, vals=merged_values)
         writer.close()
 
         

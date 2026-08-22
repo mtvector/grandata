@@ -2,10 +2,14 @@ from pathlib import Path
 
 import h5py
 import numpy as np
+import pytest
 import xarray as xr
 from scipy.sparse import csr_matrix
 
 from grandata import GRAnData, tx_io
+
+
+pybigtools = pytest.importorskip("pybigtools")
 
 
 def _write_minimal_h5ad(path):
@@ -112,3 +116,29 @@ def test_add_gtf_annotation_masks_paints_gene_body_and_tss_support(tmp_path: Pat
         np.vstack([np.zeros(10, dtype=bool), expected_locus[1]]),
     )
     assert result["rna_locus_mask"].attrs["annotation_kind"] == "tx_io_tss_projection"
+
+
+def test_write_tss_bigwigs_preserves_matrix_gene_order(tmp_path: Path) -> None:
+    gtf_path = tmp_path / "genes.gtf"
+    gtf_path.write_text(
+        "chr1\ttest\tgene\t10\t20\t.\t+\t.\tgene_name \"GeneA\";\n"
+        "chr1\ttest\tgene\t30\t40\t.\t+\t.\tgene_name \"GeneB\";\n"
+    )
+    output_dir = tmp_path / "bigwigs"
+    tx_io.write_tss_bigwigs(
+        np.array([[1.0, 2.0]]),
+        var_names=["GeneB", "GeneA"],
+        obs_names=["cell type"],
+        gtf_file=str(gtf_path),
+        target_dir=str(output_dir),
+        gtf_gene_field="gene_name",
+        n_bases=5,
+        chromsizes={"chr1": 100},
+    )
+
+    reader = pybigtools.open(str(output_dir / "cell_type.bw"), mode="r")
+    try:
+        assert reader.values("chr1", 10, 11)[0] == pytest.approx(2.0)
+        assert reader.values("chr1", 30, 31)[0] == pytest.approx(1.0)
+    finally:
+        reader.close()

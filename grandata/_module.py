@@ -45,6 +45,20 @@ class GRAnDataModule:
         Mapping from variable names in the xarray.Dataset to the keys used in the output
         dictionary of NumPy arrays or tensors. Arrays missing ``batch_dim`` are broadcast
         across the batch dimension during fast loading.
+    broadcast_missing_batch_dim : bool, default True
+        Whether arrays missing ``batch_dim`` should be repeated across every batch item.
+        When False, such arrays are cached once per iterator and yielded without an added
+        batch axis. Use this for shared conditioning matrices consumed by compatible models.
+    in_memory_keys : Optional[Sequence[str]], default None
+        Input or output names from ``load_keys`` to materialize once during ``setup`` and
+        retain in host memory. Batch-dimension indexing and transforms still apply.
+    shared_keys : Optional[Sequence[str]], default None
+        Input or output names for arrays without ``batch_dim`` that should remain shared
+        rather than being repeated across batch items.
+    emit_shuffle_indices : bool, default False
+        Add each applied dimension permutation to the batch as
+        ``__shuffle_index__{dimension}``. This permits device-resident shared inputs to
+        apply the same permutation without being transferred in every batch.
     shuffle_dims : Sequence[str], default []
         Names of dataset dimensions to shuffle when `shuffle=True` (e.g. ["obs", "var"]).
     epoch_size : int, default 100000
@@ -69,6 +83,10 @@ class GRAnDataModule:
         When using non-uniform ``sample_weights``, sample contiguous blocks of this size
         using block-summed weights to reduce random chunk reads. When None, uses fully
         random indices.
+    sample_weight_chunk_size : Optional[int], default None
+        Keep each weighted batch within one physical region chunk while preserving the
+        exact marginal ``sample_weights`` distribution. The value is the backing Zarr
+        chunk size along ``batch_dim``.
     sample_weight_min_unique : Optional[int], default None
         Minimum number of unique points to cover per sampling cycle when using block
         sampling. The loader samples blocks without replacement until this threshold
@@ -79,6 +97,10 @@ class GRAnDataModule:
         Number of batches to prefetch asynchronously ahead of the GPU/CPU consumer.
     pin_memory : Optional[str], default None
         Optional device string for torchdata PinMemory (e.g. "cuda").
+    random_state : Optional[int], default None
+        Seed for loader-local region sampling, dimension shuffling, and
+        multi-dataset selection. Set this for reproducible prefetched streams;
+        never rely on global NumPy state when asynchronous prefetch is enabled.
 
     Attributes
     ----------
@@ -111,18 +133,24 @@ class GRAnDataModule:
         adatas,                                
         batch_size: int = 32,
         load_keys: dict[str,str] = {'sequences':'sequences'},
+        broadcast_missing_batch_dim: bool = True,
+        in_memory_keys: list[str] | None = None,
+        shared_keys: list[str] | None = None,
+        emit_shuffle_indices: bool = False,
         transforms: dict[str, list] | None = None,
         shuffle_dims: list[str] = [],
         split: str = 'var-_-split',
         batch_dim: str = 'var',
         sample_weights: object | None = None,
         sample_weight_block_size: int | None = None,
+        sample_weight_chunk_size: int | None = None,
         sample_weight_min_unique: int | None = None,
         weights: list[float] | None = None,
         join: str = 'inner',    # 'inner' or 'outer'
         prefetch_factor: int = 2,
         pin_memory:    str | None = None,
         io_workers: int | None = None,
+        random_state: int | None = None,
     ):
         # ─ normalize adatas to a list ──────────────────────────────────────────
         if not isinstance(adatas, (list,tuple)):
@@ -132,15 +160,21 @@ class GRAnDataModule:
         self.shuffle_dims = shuffle_dims or []
         self.shuffle      = len(shuffle_dims) > 0
         self.load_keys    = load_keys
+        self.broadcast_missing_batch_dim = broadcast_missing_batch_dim
+        self.in_memory_keys = set(in_memory_keys or [])
+        self.shared_keys = set(shared_keys or [])
+        self.emit_shuffle_indices = emit_shuffle_indices
         self.transforms = transforms or {}
         self.split        = split
         self.batch_dim    = batch_dim
         self.sample_weights = sample_weights
         self.sample_weight_block_size = sample_weight_block_size
+        self.sample_weight_chunk_size = sample_weight_chunk_size
         self.sample_weight_min_unique = sample_weight_min_unique
         self.prefetch_factor = prefetch_factor
         self.pin_memory   = pin_memory
         self.io_workers = io_workers
+        self.random_state = random_state
 
         # ─ build state‐specific instructions once ────────────────────────────
         self.instructions = {
@@ -215,36 +249,58 @@ class GRAnDataModule:
         axes = {}
         dims_map = {}
         expand_batch = {}
+        shared_batch = {}
         for xr_key, out_key in self.load_keys.items():
             if xr_key not in group.array_keys():
                 return None
             if xr_key not in ds:
                 return None
             dims = ds[xr_key].dims
-            arrays[out_key] = group[xr_key]
+            selected_for_memory = xr_key in self.in_memory_keys or out_key in self.in_memory_keys
+            selected_as_shared = xr_key in self.shared_keys or out_key in self.shared_keys
+            arrays[out_key] = np.asarray(group[xr_key]) if selected_for_memory else group[xr_key]
             if self.batch_dim in dims:
+                if selected_as_shared:
+                    raise ValueError(
+                        f"shared key {xr_key!r} must not contain batch_dim {self.batch_dim!r}"
+                    )
                 axes[out_key] = dims.index(self.batch_dim)
                 dims_map[out_key] = dims
                 expand_batch[out_key] = False
+                shared_batch[out_key] = False
             else:
-                # Broadcast arrays missing batch_dim across the batch.
                 axes[out_key] = 0
-                dims_map[out_key] = (self.batch_dim,) + dims
-                expand_batch[out_key] = True
+                if self.broadcast_missing_batch_dim and not selected_as_shared:
+                    dims_map[out_key] = (self.batch_dim,) + dims
+                    expand_batch[out_key] = True
+                    shared_batch[out_key] = False
+                else:
+                    dims_map[out_key] = dims
+                    expand_batch[out_key] = False
+                    shared_batch[out_key] = True
 
         return {
             "arrays": arrays,
             "axes": axes,
             "dims_map": dims_map,
             "expand_batch": expand_batch,
+            "shared_batch": shared_batch,
             "indices": indices,
             "sample_weights": sample_weights,
             "sample_weight_block_size": self.sample_weight_block_size,
+            "sample_weight_chunk_size": self.sample_weight_chunk_size,
             "sample_weight_min_unique": self.sample_weight_min_unique,
             "batch_size": self.batch_size,
             "prefetch_factor": self.prefetch_factor,
             "reindexers": reindexers,
             "io_workers": self.io_workers,
+            "random_seed": (
+                None
+                if self.random_state is None
+                else self.random_state
+                + 1009 * dataset_idx
+                + {"train": 0, "val": 1, "test": 2, "predict": 3}[state]
+            ),
         }
 
     def _resolve_sample_weights(self, ds, dataset_idx: int, indices: np.ndarray):
@@ -367,9 +423,11 @@ class GRAnDataModule:
         axes = cfg["axes"]
         dims_map = cfg["dims_map"]
         expand_batch = cfg.get("expand_batch", {})
+        shared_batch = cfg.get("shared_batch", {})
         indices = cfg["indices"]
         weights = cfg.get("sample_weights")
         block_size = cfg.get("sample_weight_block_size")
+        chunk_size = cfg.get("sample_weight_chunk_size")
         min_unique = cfg.get("sample_weight_min_unique")
         reindexers = cfg["reindexers"]
         batch_size = cfg["batch_size"]
@@ -393,10 +451,37 @@ class GRAnDataModule:
             return tuple(idx if i == axis else slice(None) for i in range(arr.ndim))
 
         do_shuffle = self.instructions.get(state, {}).get("shuffle", False)
+        random_seed = cfg.get("random_seed")
+        rng = np.random if random_seed is None else np.random.default_rng(random_seed)
 
         def _iter_batches():
             if weights is not None:
-                if block_size is not None and block_size > 0:
+                if chunk_size is not None and chunk_size > 0:
+                    physical_chunks = indices // int(chunk_size)
+                    unique_chunks, inverse = np.unique(physical_chunks, return_inverse=True)
+                    del unique_chunks
+                    member_positions = [
+                        np.flatnonzero(inverse == chunk_index)
+                        for chunk_index in range(int(inverse.max()) + 1)
+                    ]
+                    chunk_weights = np.asarray(
+                        [weights[positions].sum() for positions in member_positions],
+                        dtype=float,
+                    )
+                    chunk_probs = chunk_weights / chunk_weights.sum()
+                    while True:
+                        chunk_index = int(rng.choice(len(member_positions), p=chunk_probs))
+                        positions = member_positions[chunk_index]
+                        local_weights = weights[positions]
+                        local_probs = local_weights / local_weights.sum()
+                        chosen = rng.choice(
+                            positions,
+                            size=batch_size,
+                            replace=True,
+                            p=local_probs,
+                        )
+                        yield indices[chosen]
+                elif block_size is not None and block_size > 0:
                     block_size_eff = min(int(block_size), total)
                     starts = np.arange(0, total, block_size_eff)
                     block_weights = np.zeros(len(starts), dtype=float)
@@ -414,11 +499,11 @@ class GRAnDataModule:
                         )
                     while True:
                         if blocks_per_cycle is None:
-                            block_idx = np.random.choice(len(starts), p=block_probs)
+                            block_idx = rng.choice(len(starts), p=block_probs)
                             start = starts[block_idx]
                             yield indices[start : start + block_size_eff]
                         else:
-                            chosen = np.random.choice(
+                            chosen = rng.choice(
                                 len(starts),
                                 size=blocks_per_cycle,
                                 replace=False,
@@ -429,18 +514,26 @@ class GRAnDataModule:
                                 yield indices[start : start + block_size_eff]
                 else:
                     while True:
-                        yield np.random.choice(indices, size=batch_size, replace=True, p=weights)
+                        yield rng.choice(indices, size=batch_size, replace=True, p=weights)
             for start in range(0, total, batch_size):
                 batch_idx = indices[start:start + batch_size]
                 if len(batch_idx) == 0:
                     break
                 yield batch_idx
 
+        shared_values = {
+            out_key: np.asarray(arr)
+            for out_key, arr in arrays.items()
+            if shared_batch.get(out_key, False)
+        }
+
         def _load_one(out_key, arr, axis, sel):
             key_start = time.perf_counter()
             used_oindex = 0
             used_slice = 0
-            if expand_batch.get(out_key, False):
+            if shared_batch.get(out_key, False):
+                out = shared_values[out_key]
+            elif expand_batch.get(out_key, False):
                 base = np.asarray(arr)
                 if isinstance(sel, slice):
                     batch_n = int(sel.stop - sel.start)
@@ -498,11 +591,14 @@ class GRAnDataModule:
                         for out_key, dims in dims_map.items():
                             if dim in dims:
                                 axis = dims.index(dim)
-                                shuffle_idx[dim] = np.random.permutation(batch[out_key].shape[axis])
+                                shuffle_idx[dim] = rng.permutation(batch[out_key].shape[axis])
                                 break
                     if shuffle_idx:
                         for out_key, arr in batch.items():
                             batch[out_key] = self._apply_shuffle(arr, dims_map[out_key], shuffle_idx)
+                        if self.emit_shuffle_indices:
+                            for dim, permutation in shuffle_idx.items():
+                                batch[f"__shuffle_index__{dim}"] = permutation
                 batch = self._apply_transforms(batch, dims_map, state)
                 if profiling_active:
                     prof_total_time += time.perf_counter() - batch_start
@@ -551,7 +647,11 @@ class GRAnDataModule:
                 else:
                     factory = lambda cfg=cfg: self._fast_batch_iter(cfg, state)
                 node_map[i] = IterableWrapper(_GeneratorIterable(factory))
-            source = MultiNodeWeightedSampler(node_map, self.weight_map)
+            source = MultiNodeWeightedSampler(
+                node_map,
+                self.weight_map,
+                seed=0 if self.random_state is None else self.random_state,
+            )
         node = Prefetcher(source, prefetch_factor=self.prefetch_factor)
         if self.pin_memory is not None:
             node = PinMemory(node, self.pin_memory)

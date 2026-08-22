@@ -265,6 +265,45 @@ Then each batch contains:
 
 This makes it easier to keep model-facing names stable even when on-disk variable names differ.
 
+## Keep small shared arrays resident in host memory
+
+Static metadata or conditioning matrices often omit the batch dimension and are
+small enough to retain in memory. Flag them explicitly so they are read from
+Zarr once during `setup` and are not duplicated for every sampled region:
+
+```python
+module = GRAnDataModule(
+    adatas=adata,
+    batch_size=32,
+    load_keys={
+        "X": "signal",
+        "rna_means": "rna_means",
+    },
+    in_memory_keys=["rna_means"],
+    shared_keys=["rna_means"],
+)
+```
+
+Names in `in_memory_keys` and `shared_keys` may refer to either side of
+`load_keys`. A shared key must not contain `batch_dim`. Ordinary arrays retain
+the previous streamed and batch-expanded behavior.
+
+When a device-resident consumer needs to reproduce loader shuffling without
+receiving the shared array in every batch, request the permutation metadata:
+
+```python
+module = GRAnDataModule(
+    adatas=adata,
+    batch_size=32,
+    load_keys={"X": "signal"},
+    shuffle_dims=["obs"],
+    emit_shuffle_indices=True,
+)
+```
+
+Shuffled batches then contain `__shuffle_index__obs`, a one-dimensional NumPy
+permutation suitable for applying to a cached tensor on its resident device.
+
 ## Arrays without the batch dimension
 
 If a loaded array does not contain `batch_dim`, `GRAnDataModule` broadcasts it across the batch automatically.
