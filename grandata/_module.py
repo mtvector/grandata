@@ -825,6 +825,40 @@ def _apply_target_transform_array(
     return out
 
 
+def _swap_rc_partners(batch, dims_map, target_configs, rc_flags, batch_dim):
+    """Exchange strand-paired keys on the reverse-complemented samples of a batch."""
+    rc_idx = np.flatnonzero(rc_flags)
+    if not len(rc_idx):
+        return
+    swapped: set[str] = set()
+    for key, cfg in target_configs.items():
+        partner = cfg.get("swap_on_rc")
+        if not partner or key in swapped or partner in swapped:
+            continue
+        if key not in batch or partner not in batch:
+            continue
+        if key not in dims_map or partner not in dims_map:
+            continue
+        key_dims, partner_dims = dims_map[key], dims_map[partner]
+        if batch_dim not in key_dims or batch_dim not in partner_dims:
+            continue
+        left = np.moveaxis(np.asarray(batch[key]), key_dims.index(batch_dim), 0)
+        right = np.moveaxis(np.asarray(batch[partner]), partner_dims.index(batch_dim), 0)
+        if left.shape != right.shape:
+            raise ValueError(
+                f"swap_on_rc requires matching shapes; {key} is {left.shape} "
+                f"and {partner} is {right.shape}"
+            )
+        # np.moveaxis returns views, so copy before the exchange writes over them.
+        left, right = left.copy(), right.copy()
+        held = left[rc_idx].copy()
+        left[rc_idx] = right[rc_idx]
+        right[rc_idx] = held
+        batch[key] = np.moveaxis(left, 0, key_dims.index(batch_dim))
+        batch[partner] = np.moveaxis(right, 0, partner_dims.index(batch_dim))
+        swapped.update((key, partner))
+
+
 def make_paired_dna_target_transform(
     seq_key: str,
     dnatransform,
@@ -847,8 +881,21 @@ def make_paired_dna_target_transform(
         - ``apply_window``: bool (default: True when ``seq_dim`` exists)
         - ``reverse_on_rc``: bool (default: False)
         - ``sign_flip_on_rc``: bool (default: False)
+        - ``swap_on_rc``: str | None (default: None) — name of the partner key
+          this one exchanges with on reverse-complemented samples.
     batch_dim
         Name of sample axis shared with sequence ``var`` axis.
+
+    Notes
+    -----
+    ``swap_on_rc`` exists for quantities that are defined *per strand* rather
+    than per position: reverse complementing turns a plus-strand feature into a
+    minus-strand one, so reversing each of the pair along the sequence axis puts
+    the values in the right places but leaves them under the wrong names.
+    Strand-split locus masks are the usual case. A signed track needs
+    ``sign_flip_on_rc`` instead, and a strand-agnostic mask needs neither.
+    Declaring the swap on either member of the pair is enough; the exchange runs
+    once, after every key has been windowed and reversed.
     """
     target_configs = target_configs or {}
 
@@ -897,6 +944,8 @@ def make_paired_dna_target_transform(
                 reverse_on_rc=reverse_on_rc,
                 sign_flip_on_rc=sign_flip_on_rc,
             )
+
+        _swap_rc_partners(batch, dims_map, target_configs, rc_flags, batch_dim)
         return batch
 
     _transform._stateful = True

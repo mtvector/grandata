@@ -300,3 +300,91 @@ def test_make_rc_signflip_transform_reverses_bins_and_sign(monkeypatch):
 
     expected = np.array([[[-7, -6, -5, -4], [104, 105, 106, 107]]], dtype=np.float32)
     np.testing.assert_allclose(out["signed_tracks"], expected)
+
+
+def _strand_mask_transform():
+    dnatransform = DNATransform(
+        out_len=4,
+        random_rc=True,
+        max_shift=None,
+        dimnames=("var", "seq_len", "nuc"),
+        apply_states=("train",),
+        rc_states=("train",),
+    )
+    strand_mask = {
+        "seq_dim": "seq_bins",
+        "apply_window": True,
+        "reverse_on_rc": True,
+        "sign_flip_on_rc": False,
+    }
+    return make_paired_dna_target_transform(
+        seq_key="sequence",
+        dnatransform=dnatransform,
+        target_configs={
+            "rna_forward_locus_mask": {**strand_mask, "swap_on_rc": "rna_reverse_locus_mask"},
+            "rna_reverse_locus_mask": strand_mask,
+            "gene_body_mask": strand_mask,
+        },
+        batch_dim="var",
+    )
+
+
+def _strand_mask_batch():
+    sequence = np.stack(
+        [one_hot_encode_sequence("ACGTACGT"), one_hot_encode_sequence("TTTTGGGG")],
+        axis=0,
+    )
+    # Sample 0 carries a plus-strand gene, sample 1 a minus-strand gene.
+    forward = np.array([[0, 0, 1, 1, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0]], dtype=np.float32)
+    reverse = np.array([[0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 1, 1, 0, 0, 0]], dtype=np.float32)
+    batch = {
+        "sequence": sequence,
+        "rna_forward_locus_mask": forward,
+        "rna_reverse_locus_mask": reverse,
+        "gene_body_mask": forward + reverse,
+    }
+    dims_map = {
+        "sequence": ("var", "seq_len", "nuc"),
+        "rna_forward_locus_mask": ("var", "seq_bins"),
+        "rna_reverse_locus_mask": ("var", "seq_bins"),
+        "gene_body_mask": ("var", "seq_bins"),
+    }
+    return batch, dims_map
+
+
+def test_swap_on_rc_moves_strand_masks_to_the_other_strand(monkeypatch):
+    """Reverse complementing a plus-strand gene makes it a minus-strand gene."""
+    batch, dims_map = _strand_mask_batch()
+    monkeypatch.setattr(np.random, "rand", lambda *shape: np.array([0.2, 0.8], dtype=float))
+    out = _strand_mask_transform()(batch, dims_map, "train")
+
+    # Sample 0 is reverse complemented: its footprint reverses within the window
+    # and moves from the forward mask to the reverse mask. Sample 1 is untouched.
+    np.testing.assert_allclose(
+        out["rna_forward_locus_mask"],
+        np.array([[0, 0, 0, 0], [0, 0, 0, 0]], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        out["rna_reverse_locus_mask"],
+        np.array([[0, 0, 1, 1], [0, 1, 1, 0]], dtype=np.float32),
+    )
+    # A strand-agnostic mask reverses in place and never changes keys.
+    np.testing.assert_allclose(
+        out["gene_body_mask"],
+        np.array([[0, 0, 1, 1], [0, 1, 1, 0]], dtype=np.float32),
+    )
+
+
+def test_swap_on_rc_is_inert_when_no_sample_is_reverse_complemented(monkeypatch):
+    batch, dims_map = _strand_mask_batch()
+    monkeypatch.setattr(np.random, "rand", lambda *shape: np.array([0.8, 0.8], dtype=float))
+    out = _strand_mask_transform()(batch, dims_map, "train")
+
+    np.testing.assert_allclose(
+        out["rna_forward_locus_mask"],
+        np.array([[1, 1, 0, 0], [0, 0, 0, 0]], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        out["rna_reverse_locus_mask"],
+        np.array([[0, 0, 0, 0], [0, 1, 1, 0]], dtype=np.float32),
+    )
