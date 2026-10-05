@@ -328,6 +328,7 @@ def add_bigwig_array(
     fill_value = np.nan,
     obs_chunk_size: int | None = None,
     n_workers: int = 1,
+    allow_missing_bigwigs: bool = False,
 ) -> GRAnData:
     """Compatibility wrapper around add_bigwig_array_dask (dask-first)."""
     return add_bigwig_array_dask(
@@ -344,6 +345,7 @@ def add_bigwig_array(
         n_bins=n_bins,
         fill_value=fill_value,
         obs_chunk_size=obs_chunk_size,
+        allow_missing_bigwigs=allow_missing_bigwigs,
     )
 
 
@@ -362,7 +364,15 @@ def add_bigwig_array_dask(
     n_bins: int = 1,
     fill_value: float = np.nan,
     obs_chunk_size: int | None = None,
+    allow_missing_bigwigs: bool = False,
 ) -> GRAnData:
+    """Read one BigWig per obs into ``array_name`` of the zarr-backed ``adata``.
+
+    Output is aligned to the store by obs and var labels. Every label must exist
+    in the store and every obs must have a BigWig (unless
+    ``allow_missing_bigwigs``): a mismatch used to be filled with
+    ``fill_value`` silently, which turns a naming slip into an all-fill array.
+    """
     try:
         import dask.array as da
     except ImportError as exc:
@@ -382,6 +392,12 @@ def add_bigwig_array_dask(
     obs_names = _as_py_str_array(adata[f"{obs_dim}-_-index"].values).tolist()
     file_map = {p.stem.replace(".", "_"): p for p in bw_files}
     bw_paths = [file_map.get(name) for name in obs_names]
+    missing = [name for name, path in zip(obs_names, bw_paths) if path is None]
+    if missing and not allow_missing_bigwigs:
+        raise ValueError(
+            f"{len(missing)} obs have no BigWig in {bigwig_dir} (e.g. {missing[:5]}); file stems are matched "
+            "to obs names with '.' replaced by '_'. Pass allow_missing_bigwigs=True to fill them."
+        )
 
     if obs_chunk_size is None:
         obs_chunk_size = min(16, n_obs)
@@ -420,8 +436,12 @@ def add_bigwig_array_dask(
     obs_labels = _as_py_str_array(adata[f"{obs_dim}-_-index"].values)
     if f"{var_dim}-_-index" in adata:
         var_labels = _as_py_str_array(adata[f"{var_dim}-_-index"].values)
+    elif var_dim in adata.coords:
+        var_labels = _as_py_str_array(adata.coords[var_dim].values)
     else:
         var_labels = np.arange(n_var)
+    if len(var_labels) != n_var:
+        raise ValueError(f"region_table has {n_var} rows but adata has {len(var_labels)} {var_dim} entries")
 
     da_out = xr.DataArray(
         data,
@@ -449,6 +469,15 @@ def add_bigwig_array_dask(
     else:
         store_var = np.arange(store_ds.sizes.get(var_dim, n_var))
 
+    if len(store_var) != len(var_labels) and f"{var_dim}-_-index" not in store_ds:
+        raise ValueError(f"the store has no {var_dim}-_-index to align a {var_dim} subset by")
+    for dim, labels, store_labels in ((obs_dim, obs_labels, store_obs), (var_dim, var_labels, store_var)):
+        absent = sorted(set(map(str, labels)) - set(map(str, store_labels)))
+        if absent:
+            raise ValueError(
+                f"{len(absent)} {dim} labels are not in the store (e.g. {absent[:5]}); writing would fill "
+                f"every unmatched entry with {fill_value}"
+            )
     if len(store_obs) != len(obs_labels) or len(store_var) != len(var_labels):
         da_out = da_out.reindex(
             {obs_dim: store_obs, var_dim: store_var},

@@ -97,6 +97,18 @@ class GRAnDataModule:
         Number of batches to prefetch asynchronously ahead of the GPU/CPU consumer.
     pin_memory : Optional[str], default None
         Optional device string for torchdata PinMemory (e.g. "cuda").
+    emit_batch_indices : bool, default False
+        Add each batch's store positions along ``batch_dim`` as
+        ``__index__{batch_dim}``, so batch rows can be traced back to regions.
+    dim_selectors : Optional[Dict[str, Callable]], default None
+        Per-batch selection along non-batch dimensions, applied at read time so
+        unselected entries are never loaded. Maps a dimension (e.g. ``"obs"``) to
+        ``fn(batch_indices, state) -> indices``, where ``batch_indices`` are store
+        positions along ``batch_dim`` and the returned integers index the store's
+        own order of that dimension. Shared arrays are subset the same way. The
+        chosen indices are emitted as ``__selected__{dimension}`` (after any
+        shuffle of that dimension). Selected dimensions must not need reindexing
+        across datasets.
     random_state : Optional[int], default None
         Seed for loader-local region sampling, dimension shuffling, and
         multi-dataset selection. Set this for reproducible prefetched streams;
@@ -151,6 +163,8 @@ class GRAnDataModule:
         pin_memory:    str | None = None,
         io_workers: int | None = None,
         random_state: int | None = None,
+        dim_selectors: dict | None = None,
+        emit_batch_indices: bool = False,
     ):
         # ─ normalize adatas to a list ──────────────────────────────────────────
         if not isinstance(adatas, (list,tuple)):
@@ -175,6 +189,10 @@ class GRAnDataModule:
         self.pin_memory   = pin_memory
         self.io_workers = io_workers
         self.random_state = random_state
+        self.dim_selectors = dict(dim_selectors or {})
+        self.emit_batch_indices = emit_batch_indices
+        if batch_dim in self.dim_selectors:
+            raise ValueError("dim_selectors cannot select along batch_dim")
 
         # ─ build state‐specific instructions once ────────────────────────────
         self.instructions = {
@@ -232,6 +250,12 @@ class GRAnDataModule:
                     if idx is not None:
                         indexer[i] = idx
                 reindexers[dim] = indexer
+        reindexed_selection = sorted(set(self.dim_selectors) & set(reindexers))
+        if reindexed_selection:
+            raise ValueError(
+                f"dim_selectors dimensions {reindexed_selection} differ from the unified coordinates; "
+                "selection indexes the store's own order, so these must match"
+            )
         store_path = ds.encoding["source"]
         group = zarr.open_group(store_path, mode="r")
 
@@ -293,6 +317,7 @@ class GRAnDataModule:
             "batch_size": self.batch_size,
             "prefetch_factor": self.prefetch_factor,
             "reindexers": reindexers,
+            "dim_selectors": self.dim_selectors,
             "io_workers": self.io_workers,
             "random_seed": (
                 None
@@ -527,19 +552,40 @@ class GRAnDataModule:
             if shared_batch.get(out_key, False)
         }
 
-        def _load_one(out_key, arr, axis, sel):
+        dim_selectors = cfg.get("dim_selectors") or {}
+
+        def _take_selected(out, dims, selections):
+            for dim, chosen in selections.items():
+                if dim in dims:
+                    out = np.take(out, chosen, axis=dims.index(dim))
+            return out
+
+        def _load_one(out_key, arr, axis, sel, selections):
             key_start = time.perf_counter()
             used_oindex = 0
             used_slice = 0
+            dims = dims_map[out_key]
             if shared_batch.get(out_key, False):
-                out = shared_values[out_key]
+                out = _take_selected(shared_values[out_key], dims, selections)
             elif expand_batch.get(out_key, False):
-                base = np.asarray(arr)
+                base = _take_selected(np.asarray(arr), dims[1:], selections)
                 if isinstance(sel, slice):
                     batch_n = int(sel.stop - sel.start)
                 else:
                     batch_n = int(len(sel))
                 out = np.broadcast_to(base, (batch_n,) + base.shape)
+            elif any(dim in dims for dim in selections):
+                if hasattr(arr, "oindex"):
+                    # Orthogonal read: only the selected rows' chunks are fetched.
+                    selection = list(_make_sel(arr, axis, sel))
+                    for dim, chosen in selections.items():
+                        if dim in dims:
+                            selection[dims.index(dim)] = chosen
+                    out = np.asarray(arr.oindex[tuple(selection)])
+                    used_oindex = 1
+                else:
+                    out = _take_selected(np.asarray(arr[_make_sel(arr, axis, sel)]), dims, selections)
+                    used_slice = 1
             else:
                 selection = _make_sel(arr, axis, sel)
                 if hasattr(arr, "oindex") and not isinstance(sel, slice):
@@ -558,13 +604,18 @@ class GRAnDataModule:
                 profiling_active = profile and prof_batches_done < profile_max
                 if profiling_active:
                     batch_start = time.perf_counter()
+                selections = {
+                    dim: np.asarray(fn(np.asarray(sel), state), dtype=np.intp)
+                    for dim, fn in dim_selectors.items()
+                }
+                batch_positions = np.asarray(sel, dtype=np.int64)
                 if isinstance(sel, np.ndarray) and sel.ndim == 1 and len(sel) > 1 and np.all(np.diff(sel) == 1):
                     sel = slice(int(sel[0]), int(sel[-1] + 1))
                 batch = {}
                 if executor is None:
                     for out_key, arr in arrays.items():
                         axis = axes[out_key]
-                        out_key, out, dt, used_oindex, used_slice = _load_one(out_key, arr, axis, sel)
+                        out_key, out, dt, used_oindex, used_slice = _load_one(out_key, arr, axis, sel, selections)
                         batch[out_key] = out
                         if profiling_active:
                             prof_key_time[out_key] += dt
@@ -573,7 +624,7 @@ class GRAnDataModule:
                             prof_key_slice[out_key] += used_slice
                 else:
                     futures = [
-                        executor.submit(_load_one, out_key, arr, axes[out_key], sel)
+                        executor.submit(_load_one, out_key, arr, axes[out_key], sel, selections)
                         for out_key, arr in arrays.items()
                     ]
                     for fut in futures:
@@ -585,8 +636,8 @@ class GRAnDataModule:
                             prof_key_oindex[out_key] += used_oindex
                             prof_key_slice[out_key] += used_slice
 
+                shuffle_idx = {}
                 if do_shuffle and self.shuffle_dims:
-                    shuffle_idx = {}
                     for dim in self.shuffle_dims:
                         for out_key, dims in dims_map.items():
                             if dim in dims:
@@ -599,6 +650,11 @@ class GRAnDataModule:
                         if self.emit_shuffle_indices:
                             for dim, permutation in shuffle_idx.items():
                                 batch[f"__shuffle_index__{dim}"] = permutation
+                for dim, chosen in selections.items():
+                    batch[f"__selected__{dim}"] = chosen[shuffle_idx[dim]] if dim in shuffle_idx else chosen
+                if self.emit_batch_indices:
+                    positions = batch_positions[shuffle_idx[self.batch_dim]] if self.batch_dim in shuffle_idx else batch_positions
+                    batch[f"__index__{self.batch_dim}"] = positions
                 batch = self._apply_transforms(batch, dims_map, state)
                 if profiling_active:
                     prof_total_time += time.perf_counter() - batch_start

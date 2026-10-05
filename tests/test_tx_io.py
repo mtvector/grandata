@@ -142,3 +142,35 @@ def test_write_tss_bigwigs_preserves_matrix_gene_order(tmp_path: Path) -> None:
         assert reader.values("chr1", 30, 31)[0] == pytest.approx(1.0)
     finally:
         reader.close()
+
+
+def test_write_tss_bigwigs_keeps_values_with_genes_when_names_repeat(tmp_path: Path) -> None:
+    """A name with two gene rows must not shift later genes' values onto other TSSs."""
+    gtf_path = tmp_path / "genes.gtf"
+    gtf_path.write_text(
+        "chr1\ttest\tgene\t10\t20\t.\t+\t.\tgene_name \"GeneA\";\n"
+        "chr1\ttest\tgene\t30\t40\t.\t+\t.\tgene_name \"Dup\";\n"
+        "chr2\ttest\tgene\t30\t40\t.\t-\t.\tgene_name \"Dup\";\n"
+        "chr1\ttest\tgene\t50\t60\t.\t+\t.\tgene_name \"GeneC\";\n"
+        "chr1\ttest\tgene\t70\t80\t.\t+\t.\tgene_name \"GeneD\";\n"
+    )
+    output_dir = tmp_path / "bigwigs"
+    tx_io.write_tss_bigwigs(
+        np.array([[1.0, 2.0, 3.0, 4.0]]),
+        var_names=["GeneA", "Dup", "GeneC", "GeneD"],
+        obs_names=["cell"],
+        gtf_file=str(gtf_path),
+        target_dir=str(output_dir),
+        gtf_gene_field="gene_name",
+        n_bases=5,
+        chromsizes={"chr1": 100, "chr2": 100},
+    )
+    reader = pybigtools.open(str(output_dir / "cell.bw"), mode="r")
+    try:
+        assert reader.values("chr1", 10, 11)[0] == pytest.approx(1.0)
+        assert reader.values("chr1", 30, 31)[0] == pytest.approx(2.0)
+        assert reader.values("chr2", 40, 41)[0] == pytest.approx(-2.0)
+        assert reader.values("chr1", 50, 51)[0] == pytest.approx(3.0)
+        assert reader.values("chr1", 70, 71)[0] == pytest.approx(4.0)
+    finally:
+        reader.close()

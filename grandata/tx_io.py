@@ -11,6 +11,8 @@ from pathlib import Path
 from itertools import product
 import re
 from typing import Union, Literal, List, Tuple, Dict, Iterator, Mapping, Sequence
+from dataclasses import dataclass
+import warnings
 import dask.array as da
 import weakref
 
@@ -66,16 +68,73 @@ def read_gtf(gtf: str) -> pd.DataFrame:
     return df
 
 
-def _iter_matched_gene_intervals(
-    *,
+@dataclass(frozen=True)
+class GeneLocus:
+    """One painted gene locus; ``start``/``end`` are the GTF integer positions."""
+
+    name: str
+    chrom: str
+    start: int
+    end: int
+    strand: str
+    source: str  # "gene" row, or "transcripts" when derived from transcript spans
+
+    @property
+    def tss(self) -> int:
+        return self.start if self.strand == "+" else self.end
+
+
+@dataclass
+class GeneAnnotation:
+    """Loci for the requested genes, with what had to be inferred to get them."""
+
+    loci: list[GeneLocus]
+    requested: int
+    unmatched: list[str]
+    derived: list[str]
+    multi_locus: list[str]
+    gene_row_sequences: int
+    transcript_sequences: int
+
+    def summary(self) -> dict:
+        return {
+            "requested_gene_count": self.requested,
+            "matched_gene_count": len({locus.name for locus in self.loci}),
+            "unmatched_gene_count": len(self.unmatched),
+            "derived_from_transcripts_gene_count": len(self.derived),
+            "multi_locus_gene_count": len(self.multi_locus),
+            "locus_count": len(self.loci),
+            "gene_row_sequences": self.gene_row_sequences,
+            "transcript_sequences": self.transcript_sequences,
+        }
+
+
+def load_gene_loci(
     gtf_file: str | Path,
-    gene_names: set[str],
-    gtf_gene_field: str,
-    gene_replace_dict: Mapping[str, str] | None,
-    tss_projection_bases: int,
-) -> Iterator[tuple[str, int, int, int, int, str]]:
-    """Yield matched GTF gene bodies and their tx_io TSS projection intervals."""
+    *,
+    gene_names: Sequence[str],
+    gtf_gene_field: str = "gene_name",
+    gene_replace_dict: Mapping[str, str] | None = None,
+    missing_gene_rows: Literal["derive", "skip", "error"] = "derive",
+) -> GeneAnnotation:
+    """Gene loci for ``gene_names`` from a GTF, the single source for tracks and masks.
+
+    Names are matched after ``gene_replace_dict``. A name's ``gene`` rows are
+    all kept (paralogs, or several genes renamed to one symbol, give several
+    loci). Some GTFs (e.g. NCBI Mmul10) carry ``gene`` rows for only part of
+    the genome; for genes with transcripts but no gene row,
+    ``missing_gene_rows="derive"`` uses the span of the transcripts at the
+    gene's most-transcribed locus, ``"skip"`` drops them and ``"error"`` raises.
+    Inferences are reported as warnings and in :meth:`GeneAnnotation.summary`.
+    """
+    if missing_gene_rows not in ("derive", "skip", "error"):
+        raise ValueError("missing_gene_rows must be 'derive', 'skip' or 'error'")
+    wanted = {str(name) for name in gene_names}
     pattern = re.compile(rf'(?:^|;\s*){re.escape(gtf_gene_field)}\s+"([^"]+)"')
+    gene_rows: dict[str, list[GeneLocus]] = {}
+    spans: dict[tuple[str, str, str], list[int]] = {}
+    gene_row_sequences: set[str] = set()
+    transcript_sequences: set[str] = set()
     path = Path(gtf_file)
     opener = gzip.open if path.suffix == ".gz" else open
     with opener(path, "rt") as handle:
@@ -83,21 +142,72 @@ def _iter_matched_gene_intervals(
             if line.startswith("#"):
                 continue
             fields = line.rstrip("\n").split("\t")
-            if len(fields) != 9 or fields[2] != "gene":
+            if len(fields) != 9 or fields[2] not in ("gene", "transcript"):
                 continue
+            if fields[2] == "gene":
+                gene_row_sequences.add(fields[0])
+            else:
+                transcript_sequences.add(fields[0])
             match = pattern.search(fields[8])
             if match is None:
                 continue
-            gene_name = match.group(1)
+            name = match.group(1)
             if gene_replace_dict is not None:
-                gene_name = gene_replace_dict.get(gene_name, gene_name)
-            if gene_name not in gene_names:
+                name = gene_replace_dict.get(name, name)
+            if name not in wanted:
                 continue
-            chrom = fields[0]
-            body_start = int(fields[3])
-            body_end = int(fields[4])
-            tss = body_start if fields[6] == "+" else body_end
-            yield chrom, body_start, body_end, tss, tss + tss_projection_bases, fields[6]
+            start, end = int(fields[3]), int(fields[4])
+            if fields[2] == "gene":
+                gene_rows.setdefault(name, []).append(GeneLocus(name, fields[0], start, end, fields[6], "gene"))
+            else:
+                key = (name, fields[0], fields[6])
+                span = spans.setdefault(key, [start, end, 0])
+                span[0], span[1], span[2] = min(span[0], start), max(span[1], end), span[2] + 1
+    loci = [locus for rows in gene_rows.values() for locus in rows]
+    only_transcripts = sorted({key[0] for key in spans} - set(gene_rows))
+    if only_transcripts and missing_gene_rows == "error":
+        raise ValueError(
+            f"{len(only_transcripts)} genes have transcripts but no gene row in {gtf_file} "
+            f"(e.g. {only_transcripts[:5]}); pass missing_gene_rows='derive' to use transcript spans"
+        )
+    derived: list[str] = []
+    if missing_gene_rows == "derive":
+        by_name: dict[str, list[tuple[tuple[str, str, str], list[int]]]] = {}
+        for key, span in spans.items():
+            by_name.setdefault(key[0], []).append((key, span))
+        for name in only_transcripts:
+            (_, chrom, strand), (start, end, _) = max(by_name[name], key=lambda item: item[1][2])
+            loci.append(GeneLocus(name, chrom, start, end, strand, "transcripts"))
+            derived.append(name)
+    matched = {locus.name for locus in loci}
+    counts: dict[str, int] = {}
+    for locus in loci:
+        counts[locus.name] = counts.get(locus.name, 0) + 1
+    annotation = GeneAnnotation(
+        loci=loci,
+        requested=len(wanted),
+        unmatched=sorted(wanted - matched),
+        derived=derived,
+        multi_locus=sorted(name for name, count in counts.items() if count > 1),
+        gene_row_sequences=len(gene_row_sequences),
+        transcript_sequences=len(transcript_sequences),
+    )
+    if transcript_sequences - gene_row_sequences:
+        warnings.warn(
+            f"{gtf_file}: gene rows cover {len(gene_row_sequences)} of {len(transcript_sequences)} sequences "
+            f"with transcripts; {len(derived)} genes were "
+            + ("derived from transcript spans" if missing_gene_rows == "derive" else "left without loci"),
+            stacklevel=2,
+        )
+    elif derived:
+        warnings.warn(f"{gtf_file}: {len(derived)} genes lack gene rows; derived from transcript spans", stacklevel=2)
+    if annotation.multi_locus:
+        warnings.warn(
+            f"{len(annotation.multi_locus)} gene names have more than one locus "
+            f"(e.g. {annotation.multi_locus[:5]}); each locus is painted with that name's value",
+            stacklevel=2,
+        )
+    return annotation
 
 
 def _paint_interval_mask(
@@ -162,13 +272,16 @@ def add_gtf_annotation_masks(
     rna_forward_locus_array_name: str = "rna_forward_locus_mask",
     rna_reverse_locus_array_name: str = "rna_reverse_locus_mask",
     chunk_size: int = 128,
+    missing_gene_rows: Literal["derive", "skip", "error"] = "derive",
 ) -> GRAnData:
     """Add matched GTF gene-body and tx_io TSS-support masks to a GRAnData store.
 
-    Coordinates intentionally follow ``write_tss_bigwigs``: GTF integer positions
-    are used directly, and each RNA locus is ``[TSS, TSS + tss_projection_bases)``.
-    Only genes represented by ``gene_names`` are painted. Never use the gene-body
-    mask as the structural support of an RNA track; use ``rna_locus_array_name``.
+    Loci come from :func:`load_gene_loci`, the same source ``write_tss_bigwigs``
+    uses, so masks and RNA tracks always cover the same genes. GTF integer
+    positions are used directly, and each RNA locus is
+    ``[TSS, TSS + tss_projection_bases)``. Only genes represented by
+    ``gene_names`` are painted. Never use the gene-body mask as the structural
+    support of an RNA track; use ``rna_locus_array_name``.
     """
     if tss_projection_bases < 1:
         raise ValueError("tss_projection_bases must be positive")
@@ -180,13 +293,17 @@ def add_gtf_annotation_masks(
     if seq_dim not in adata.sizes:
         raise KeyError(f"GRAnData is missing sequence dimension: {seq_dim}")
 
-    matched = list(_iter_matched_gene_intervals(
-        gtf_file=gtf_file,
-        gene_names=set(map(str, gene_names)),
+    annotation = load_gene_loci(
+        gtf_file,
+        gene_names=gene_names,
         gtf_gene_field=gtf_gene_field,
         gene_replace_dict=gene_replace_dict,
-        tss_projection_bases=tss_projection_bases,
-    ))
+        missing_gene_rows=missing_gene_rows,
+    )
+    matched = [
+        (locus.chrom, locus.start, locus.end, locus.tss, locus.tss + tss_projection_bases, locus.strand)
+        for locus in annotation.loci
+    ]
     body_intervals: dict[str, list[tuple[int, int]]] = {}
     locus_intervals: dict[str, list[tuple[int, int]]] = {}
     forward_locus_intervals: dict[str, list[tuple[int, int]]] = {}
@@ -236,8 +353,9 @@ def add_gtf_annotation_masks(
     provenance = {
         "gtf_file": str(gtf_file),
         "gtf_gene_field": gtf_gene_field,
-        "matched_gene_count": len(matched),
         "tss_projection_bases": tss_projection_bases,
+        "missing_gene_rows": missing_gene_rows,
+        **annotation.summary(),
     }
     dataset = xr.Dataset({
         gene_body_array_name: xr.DataArray(
@@ -542,6 +660,26 @@ def close_h5_backing(ds: xr.Dataset) -> None:
     elif f is not None:
         f.close()
 
+def _sanitize_obs_name(name: str) -> str:
+    return re.sub(" ", "_", re.sub("/", "-", str(name)))
+
+
+def _isolated_loci(loci: list[GeneLocus], n_bases: int) -> list[int]:
+    """Indices of loci whose TSS projection overlaps no other projection."""
+    by_chrom: dict[str, list[tuple[int, int]]] = {}
+    for index, locus in enumerate(loci):
+        by_chrom.setdefault(locus.chrom, []).append((locus.tss, index))
+    isolated = []
+    for entries in by_chrom.values():
+        entries.sort()
+        for position, (tss, index) in enumerate(entries):
+            before = entries[position - 1][0] if position > 0 else None
+            after = entries[position + 1][0] if position + 1 < len(entries) else None
+            if (before is None or tss - before >= n_bases) and (after is None or after - tss >= n_bases):
+                isolated.append(index)
+    return isolated
+
+
 def write_tss_bigwigs(
     matrix: np.ndarray | xr.DataArray,
     var_names: list[str] | None,
@@ -551,11 +689,19 @@ def write_tss_bigwigs(
     gtf_gene_field: str = 'gene',
     n_bases: int = 1000,
     chromsizes: dict[str, int] = None,
-    gene_replace_dict = None
-):
+    gene_replace_dict = None,
+    missing_gene_rows: Literal["derive", "skip", "error"] = "derive",
+    verify_loci: int = 200,
+) -> dict:
     """
     Write signed TSS-aligned transcription bigWig files (1 per obs),
     merging any overlapping TSS intervals by summing their values.
+
+    Gene loci come from :func:`load_gene_loci` (shared with
+    ``add_gtf_annotation_masks``); every locus is painted with the value of its
+    own gene, looked up by name. After writing, each file is read back at up to
+    ``verify_loci`` loci whose projection overlaps no other, and a mismatch with
+    the intended value raises. Returns the annotation summary.
 
     Parameters
     ----------
@@ -563,7 +709,7 @@ def write_tss_bigwigs(
         Shape (n_obs, n_var), transcription values. If DataArray, obs/var names
         can be inferred from its coords.
     var_names : list[str] | None
-        Names of genes, in the same order as matrix columns.
+        Names of genes, in the same order as matrix columns. Must be unique.
     obs_names : list[str] | None
         Names for each observation (e.g. clusters, pseudobulk sets).
     gtf_file : str
@@ -573,15 +719,18 @@ def write_tss_bigwigs(
     n_bases : int
         Number of bases downstream of the TSS to represent.
     chromsizes : dict[str, int], optional
-        Chromosome sizes. If not provided, inferred from GTF.
+        Chromosome sizes. If not provided, inferred from the loci.
     gene_replace_dict : dict
         Dictionary to convert GTF gene names to new names
+    missing_gene_rows : {"derive", "skip", "error"}
+        Genes with transcripts but no gene row; see :func:`load_gene_loci`.
+    verify_loci : int
+        Loci read back per file after writing; 0 disables the check.
     """
     target_dir = Path(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
 
     obs_dim = None
-    var_dim = None
     if isinstance(matrix, xr.DataArray):
         obs_dim, var_dim = matrix.dims[:2]
         if obs_names is None:
@@ -590,131 +739,184 @@ def write_tss_bigwigs(
             var_names = matrix.coords[var_dim].astype(str).tolist()
     if obs_names is None or var_names is None:
         raise ValueError("obs_names and var_names must be provided for ndarray inputs.")
-    
-    # --- Load GTF and restrict to gene-level features ---
-    gtf = read_gtf(gtf_file)
-    gtf = gtf.loc[gtf["feature"] == "gene"]
+    var_names = [str(name) for name in var_names]
+    column_of = {name: index for index, name in enumerate(var_names)}
+    if len(column_of) != len(var_names):
+        raise ValueError("var_names must be unique")
+    if len(var_names) != matrix.shape[1] or len(obs_names) != matrix.shape[0]:
+        raise ValueError(f"matrix shape {tuple(matrix.shape)} does not match obs_names/var_names")
 
-    if gene_replace_dict is not None:
-        gtf[gtf_gene_field] = [gene_replace_dict.get(x,x) for x in gtf[gtf_gene_field]]
-    gtf = gtf.loc[~gtf[gtf_gene_field].isna()]
-    
-    gtf_gene_names = set(gtf[gtf_gene_field].unique())
-    # Preserve matrix column order. A set intersection here silently detached
-    # expression values from their genes because set iteration order is not the
-    # order of ``var_names``.
-    shared_var_names = [name for name in var_names if name in gtf_gene_names]
-    gtf = gtf.loc[gtf[gtf_gene_field].isin(shared_var_names)]
-    gtf = gtf.dropna(subset=["seqname", "start", "end", "strand", gtf_gene_field])
-    
-    # Re‐align matrix to only those var_names that exist in GTF:
-    keep_mask = np.array([x in shared_var_names for x in var_names])
-    matrix = matrix[:, keep_mask]
-
-    # Now re‐index GTF so that the row order matches shared_var_names exactly:
-    gtf_by_name = gtf.set_index(gtf_gene_field).loc[shared_var_names]
-
-    # Infer chromsizes if needed:
+    annotation = load_gene_loci(
+        gtf_file,
+        gene_names=var_names,
+        gtf_gene_field=gtf_gene_field,
+        gene_replace_dict=gene_replace_dict,
+        missing_gene_rows=missing_gene_rows,
+    )
+    loci = annotation.loci
+    value_columns = np.asarray([column_of[locus.name] for locus in loci], dtype=np.int64)
     if chromsizes is None:
-        chromsizes = (
-            gtf_by_name[["seqname", "end"]]
-            .groupby("seqname")["end"]
-            .max()
-            .astype(int)
-            .to_dict()
-        )
+        chromsizes = {}
+        for locus in loci:
+            chromsizes[locus.chrom] = max(chromsizes.get(locus.chrom, 0), locus.end, locus.tss + n_bases)
+    rng = np.random.default_rng(0)
+    isolated = _isolated_loci(loci, n_bases)
+    probes = rng.choice(isolated, size=min(verify_loci, len(isolated)), replace=False) if verify_loci else []
 
-    # Extract per‐gene chromosome, TSS position, and strand:
-    chroms = gtf_by_name["seqname"].tolist()
-    starts = gtf_by_name["start"].astype(int).tolist()
-    ends = gtf_by_name["end"].astype(int).tolist()
-    strands = gtf_by_name["strand"].tolist()
-    # TSS is 'start' if '+' strand, else 'end' for '-'
-    tss_list = [s if strand == "+" else e for s, e, strand in zip(starts, ends, strands)]
-
-    # --- Now write one BigWig per observation, merging overlaps ---
     for obs_idx, obs_name in enumerate(obs_names):
-        obs_name = re.sub('/','-',obs_name) #just in case people (like me) have silly names
-        obs_name = re.sub(' ','_',obs_name)
-        
+        obs_name = _sanitize_obs_name(obs_name)
         print('writing',obs_name)
         path = target_dir / f"{obs_name}.bw"
 
+        if isinstance(matrix, xr.DataArray):
+            row_vals = np.asarray(matrix.isel({obs_dim: obs_idx}).data).ravel()
+        else:
+            row_vals = np.asarray(matrix[obs_idx]).ravel()
+        gene_vals = row_vals[value_columns]
+
         # 1) Build the raw interval list: (chrom, start, end, signed_value)
         raw_intervals: list[tuple[str, int, int, float]] = []
-        if isinstance(matrix, xr.DataArray):
-            row = matrix.isel({obs_dim: obs_idx}).data
-            row_vals = np.asarray(row).ravel()
-        else:
-            row_vals = matrix[obs_idx]
-        for i, value in tqdm(list(enumerate(row_vals)), desc=f"Building intervals for {obs_name}", leave=False):
-            chrom = chroms[i]
-            tss = tss_list[i]
-            strand = strands[i]
-
-            # Define the 0-based interval [tss, tss + n_bases)
-            start = tss
-            end = tss + n_bases
-            if start >= chromsizes.get(chrom, 0):
+        for locus, value in zip(loci, gene_vals):
+            start = locus.tss
+            end = locus.tss + n_bases
+            if start >= chromsizes.get(locus.chrom, 0):
                 continue
-            if end > chromsizes[chrom]:
-                end = chromsizes[chrom]
-
-            signed_value = float(value) * (1.0 if strand == "+" else -1.0)
-            raw_intervals.append((chrom, start, end, signed_value))
+            end = min(end, chromsizes[locus.chrom])
+            raw_intervals.append((locus.chrom, start, end, float(value) * (1.0 if locus.strand == "+" else -1.0)))
 
         # 2) Group intervals by chromosome
         chrom_to_intervals: dict[str, list[tuple[int, int, float]]] = {}
         for chrom, s, e, v in raw_intervals:
             chrom_to_intervals.setdefault(chrom, []).append((s, e, v))
 
-        # 3) For each chromosome, merge overlapping intervals via sweep‐line
+        # 3) For each chromosome, merge overlapping intervals via sweep-line
         merged_values: list[tuple[str, int, int, float]] = []
         for chrom, iv_list in chrom_to_intervals.items():
-            # Build event list: (position, delta_value). We'll store both +v at start, −v at end.
             events: list[tuple[int, float]] = []
             for s, e, v in iv_list:
-                # Only consider non‐empty intervals
                 if e <= s:
                     continue
                 events.append((s, +v))
                 events.append((e, -v))
-
-            # Sort by position. If two events share the same position, ensure positive deltas come first
-            # so that we do not accidentally drop a segment where a start and end coincide.
+            # Positive deltas first at a shared position, so a segment where a
+            # start and an end coincide is not dropped.
             events.sort(key=lambda x: (x[0], -x[1]))
-
             current_sum = 0.0
             prev_pos = None
             idx = 0
             n_events = len(events)
-
             while idx < n_events:
                 pos = events[idx][0]
-                # Before we add the deltas at 'pos', if there's a previous segment running
                 if prev_pos is not None and pos > prev_pos and current_sum != 0.0:
-                    # Emit the merged interval [prev_pos, pos) with the running sum
                     merged_values.append((chrom, prev_pos, pos, current_sum))
-
-                # Now consume all events with this same 'pos'
                 while idx < n_events and events[idx][0] == pos:
                     current_sum += events[idx][1]
                     idx += 1
-
                 prev_pos = pos
 
-            # No need to handle trailing segment: by definition, once current_sum returns to zero,
-            # no further intervals remain. If it never returns to zero, we've handled until the last event.
-
-        # 4) Finally, sort merged_values by chromosome + start (just in case)
+        # 4) Write the merged intervals, sorted by chromosome and start
         merged_values.sort(key=lambda x: (x[0], x[1]))
-
-        # 5) Write out the merged intervals to BigWig
         writer = pybigtools.open(str(path), mode='w')
         writer.write(chroms=chromsizes, vals=merged_values)
         writer.close()
 
-        
+        # 5) Read back isolated loci: each must carry its own gene's signed value.
+        if len(probes):
+            reader = pybigtools.open(str(path), mode="r")
+            try:
+                wrong = []
+                for index in probes:
+                    locus = loci[index]
+                    if locus.tss >= chromsizes.get(locus.chrom, 0):
+                        continue
+                    expected = float(gene_vals[index]) * (1.0 if locus.strand == "+" else -1.0)
+                    if not np.isfinite(expected):
+                        continue
+                    got = float(reader.values(locus.chrom, locus.tss, locus.tss + 1, missing=0.0)[0])
+                    if not np.isclose(got, expected, rtol=1e-4, atol=1e-6):
+                        wrong.append((locus.name, locus.chrom, locus.tss, expected, got))
+            finally:
+                reader.close()
+            if wrong:
+                raise RuntimeError(f"{path}: {len(wrong)} of {len(probes)} verified loci carry the wrong value, e.g. {wrong[:3]}")
+    return annotation.summary()
+
+
+def audit_tss_tracks(
+    adata: GRAnData,
+    *,
+    expression: np.ndarray,
+    gene_names: Sequence[str],
+    obs_names: Sequence[str],
+    gtf_file: str | Path,
+    gtf_gene_field: str = "gene_name",
+    gene_replace_dict: Mapping[str, str] | None = None,
+    array_name: str = "rna_tracks",
+    n_bases: int = 1000,
+    probes: int = 500,
+    missing_gene_rows: Literal["derive", "skip", "error"] = "derive",
+    var_dim: str = "var",
+    seq_dim: str = "seq_bins",
+    obs_dim: str = "obs",
+    seed: int = 0,
+) -> dict:
+    """Check a store's binned RNA tracks against the expression they were built from.
+
+    For random isolated TSS loci that lie inside a stored region, compares the
+    track's bin at the projection's midpoint with the gene's signed value in
+    ``expression`` ``(obs, gene)``. Returns the matching fraction and examples
+    of mismatches; a correctly built store matches ~1.0.
+    """
+    gene_names = [str(name) for name in gene_names]
+    column_of = {name: index for index, name in enumerate(gene_names)}
+    annotation = load_gene_loci(
+        gtf_file, gene_names=gene_names, gtf_gene_field=gtf_gene_field,
+        gene_replace_dict=gene_replace_dict, missing_gene_rows=missing_gene_rows,
+    )
+    loci = annotation.loci
+    chroms = np.asarray([str(v) for v in np.asarray(adata[f"{var_dim}-_-chrom"].values).tolist()])
+    starts = np.asarray(adata[f"{var_dim}-_-start"].values, dtype=np.int64)
+    ends = np.asarray(adata[f"{var_dim}-_-end"].values, dtype=np.int64)
+    n_bins = int(adata.sizes[seq_dim])
+    store_obs = [str(v) for v in np.asarray(adata[f"{obs_dim}-_-index"].values).tolist()]
+    obs_rows = [(store_obs.index(_sanitize_obs_name(name)), row) for row, name in enumerate(obs_names)
+                if _sanitize_obs_name(name) in store_obs]
+    if not obs_rows:
+        raise ValueError("no obs_names match the store's obs")
+    by_chrom = {chrom: np.flatnonzero(chroms == chrom) for chrom in np.unique(chroms)}
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(_isolated_loci(loci, n_bases))
+    checked, wrong = 0, []
+    array = adata[array_name]
+    for index in order:
+        if checked >= probes:
+            break
+        locus = loci[index]
+        middle = locus.tss + n_bases // 2
+        pool = by_chrom.get(locus.chrom)
+        if pool is None:
+            continue
+        inside = pool[(starts[pool] <= locus.tss) & (ends[pool] >= locus.tss + n_bases)]
+        if inside.size == 0:
+            continue
+        region = int(inside[0])
+        width = int(ends[region] - starts[region])
+        bin_index = int((middle - starts[region]) * n_bins // width)
+        store_row, expression_row = obs_rows[int(rng.integers(len(obs_rows)))]
+        expected = float(np.nan_to_num(expression[expression_row, column_of[locus.name]]))
+        expected *= 1.0 if locus.strand == "+" else -1.0
+        got = float(np.nan_to_num(array[store_row, region, bin_index].values))
+        checked += 1
+        if not np.isclose(got, expected, rtol=1e-3, atol=1e-5):
+            wrong.append({"gene": locus.name, "chrom": locus.chrom, "tss": locus.tss, "expected": expected, "got": got})
+    return {
+        "checked": checked,
+        "matching_fraction": 1.0 - len(wrong) / max(checked, 1),
+        "mismatches": wrong[:10],
+        **annotation.summary(),
+    }
+
+
 def group_aggr_xr(
     ds: xr.Dataset,
     array_name: str,
