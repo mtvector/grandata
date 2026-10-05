@@ -792,26 +792,31 @@ def write_tss_bigwigs(
         # 3) For each chromosome, merge overlapping intervals via sweep-line
         merged_values: list[tuple[str, int, int, float]] = []
         for chrom, iv_list in chrom_to_intervals.items():
-            events: list[tuple[int, float]] = []
+            events: list[tuple[int, float, int]] = []
             for s, e, v in iv_list:
                 if e <= s:
                     continue
-                events.append((s, +v))
-                events.append((e, -v))
-            # Positive deltas first at a shared position, so a segment where a
-            # start and an end coincide is not dropped.
-            events.sort(key=lambda x: (x[0], -x[1]))
+                events.append((s, +v, +1))
+                events.append((e, -v, -1))
+            events.sort(key=lambda x: x[0])
+            # Count open intervals: with none open the value is exactly zero.
+            # Trusting the running float sum left ~1e-15 residues that became
+            # segments spanning every gap between genes.
             current_sum = 0.0
+            open_count = 0
             prev_pos = None
             idx = 0
             n_events = len(events)
             while idx < n_events:
                 pos = events[idx][0]
-                if prev_pos is not None and pos > prev_pos and current_sum != 0.0:
+                if prev_pos is not None and pos > prev_pos and open_count > 0 and current_sum != 0.0:
                     merged_values.append((chrom, prev_pos, pos, current_sum))
                 while idx < n_events and events[idx][0] == pos:
                     current_sum += events[idx][1]
+                    open_count += events[idx][2]
                     idx += 1
+                if open_count == 0:
+                    current_sum = 0.0
                 prev_pos = pos
 
         # 4) Write the merged intervals, sorted by chromosome and start

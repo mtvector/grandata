@@ -182,3 +182,32 @@ def test_writer_rejects_a_file_whose_values_do_not_match_their_genes(gtf, tmp_pa
                 EXPRESSION, var_names=GENES, obs_names=CELLS, gtf_file=str(gtf), target_dir=str(tmp_path / "bw"),
                 gtf_gene_field="gene_name", n_bases=500, chromsizes=CHROMSIZES,
             )
+
+
+def test_merged_tracks_are_exactly_zero_between_loci(tmp_path):
+    """Overlapping float values must not leave rounding residue spanning the gaps."""
+    rows, names = [], []
+    rng = np.random.default_rng(0)
+    for i in range(60):
+        start = 1000 + (i // 3) * 2000 + (i % 3) * 300  # triplets of overlapping projections
+        rows.append(f'chr1\tt\tgene\t{start}\t{start + 500}\t.\t+\t.\tgene_name "G{i}";\n')
+        names.append(f"G{i}")
+    gtf = tmp_path / "many.gtf"
+    gtf.write_text("".join(rows))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        tx_io.write_tss_bigwigs(
+            rng.random((1, 60)) * 0.1 + 0.07, var_names=names, obs_names=["c"], gtf_file=str(gtf),
+            target_dir=str(tmp_path / "bw"), gtf_gene_field="gene_name", n_bases=1000, chromsizes={"chr1": 50_000},
+        )
+    reader = pybigtools.open(str(tmp_path / "bw" / "c.bw"), mode="r")
+    try:
+        values = np.asarray(reader.values("chr1", 0, 50_000, missing=0.0))
+    finally:
+        reader.close()
+    covered = np.zeros(50_000, dtype=bool)
+    for i in range(60):
+        start = 1000 + (i // 3) * 2000 + (i % 3) * 300
+        covered[start : start + 1000] = True
+    assert (values[~covered] == 0).all()
+    assert (values[covered] > 0.06).all()
