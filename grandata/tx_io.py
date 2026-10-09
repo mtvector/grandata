@@ -829,6 +829,8 @@ def write_tss_bigwigs(
         if len(probes):
             reader = pybigtools.open(str(path), mode="r")
             try:
+                # A contig whose loci are all zero gets no entries and is left out of the file.
+                written = set(reader.chroms())
                 wrong = []
                 for index in probes:
                     locus = loci[index]
@@ -837,7 +839,7 @@ def write_tss_bigwigs(
                     expected = float(gene_vals[index]) * (1.0 if locus.strand == "+" else -1.0)
                     if not np.isfinite(expected):
                         continue
-                    got = float(reader.values(locus.chrom, locus.tss, locus.tss + 1, missing=0.0)[0])
+                    got = float(reader.values(locus.chrom, locus.tss, locus.tss + 1, missing=0.0)[0]) if locus.chrom in written else 0.0
                     if not np.isclose(got, expected, rtol=1e-4, atol=1e-6):
                         wrong.append((locus.name, locus.chrom, locus.tss, expected, got))
             finally:

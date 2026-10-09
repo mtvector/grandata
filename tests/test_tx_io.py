@@ -144,6 +144,32 @@ def test_write_tss_bigwigs_preserves_matrix_gene_order(tmp_path: Path) -> None:
         reader.close()
 
 
+def test_write_tss_bigwigs_verifies_contig_with_only_zero_genes(tmp_path: Path) -> None:
+    """A contig whose genes are all zero is absent from the file; read-back must treat it as zero."""
+    gtf_path = tmp_path / "genes.gtf"
+    gtf_path.write_text(
+        "chr1\ttest\tgene\t10\t20\t.\t+\t.\tgene_name \"GeneA\";\n"
+        "scaffold9\ttest\tgene\t10\t20\t.\t+\t.\tgene_name \"GeneZ\";\n"
+    )
+    output_dir = tmp_path / "bigwigs"
+    tx_io.write_tss_bigwigs(
+        np.array([[1.0, 0.0]]),
+        var_names=["GeneA", "GeneZ"],
+        obs_names=["cell"],
+        gtf_file=str(gtf_path),
+        target_dir=str(output_dir),
+        gtf_gene_field="gene_name",
+        n_bases=5,
+        chromsizes={"chr1": 100, "scaffold9": 100},
+    )
+    reader = pybigtools.open(str(output_dir / "cell.bw"), mode="r")
+    try:
+        assert "scaffold9" not in reader.chroms()
+        assert reader.values("chr1", 10, 11)[0] == pytest.approx(1.0)
+    finally:
+        reader.close()
+
+
 def test_write_tss_bigwigs_keeps_values_with_genes_when_names_repeat(tmp_path: Path) -> None:
     """A name with two gene rows must not shift later genes' values onto other TSSs."""
     gtf_path = tmp_path / "genes.gtf"
